@@ -16,6 +16,14 @@ linters:
         - name: exported
           disabled: false
 
+    errcheck:
+      # Writes to the terminal cannot fail in a way the program could act on,
+      # and checking each one would bury the reporting logic in noise.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
   exclusions:
     rules:
       # MD5 is not a choice here; the protocol specifies it.

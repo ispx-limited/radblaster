@@ -8,32 +8,37 @@ load on your authentication and accounting servers with one binary and no
 access network.
 
 ```sh
-radblaster auth -server 10.0.0.1:1812 -user subscriber@example.net -password secret
+radblaster run -server 10.0.0.1:1812 -password secret -rate 5000 -duration 30s
 ```
 
 ## Status
 
-Early. The RADIUS protocol layer is implemented and tested, and the `auth`
-command sends a single Access-Request and reports the reply. **The load engine
-is not built yet**, so today this is a correctness tool rather than a stress
-tool.
+Early but useful. Authentication load works end to end: on a desktop machine it
+sustains over 100,000 Access-Requests per second against a real RADIUS server.
+Accounting, CoA and the web interface are not built yet.
 
 What works:
 
-- Access-Request with PAP or CHAP authentication
+- Sustained Access-Request load at a target rate, or as fast as the sockets allow
+- PAP and CHAP authentication
+- Latency percentiles, reported both from the scheduled send and from the actual
+  send, so time lost to the generator falling behind cannot be mistaken for the
+  server being slow
+- Failures separated by cause: a timeout, a reply that fails verification, and a
+  policy rejection are counted apart, because they need different remedies
+- Notes that explain what limited the run, including the throughput ceiling
+  implied by the number of sockets and the server's response time
 - Message-Authenticator on every request, and verification of it on replies
-- Response Authenticator verification, so a reply signed with the wrong secret
-  is reported as such rather than as a timeout
-- Retransmission with the identical encoded packet, so a server can recognise
-  the duplicate
-- Attribute decoding for the standard RFC attribute set
+- Reproducible runs with `-seed`
 
 What does not work yet:
 
-- Sustained load, concurrency, and rate control
 - Accounting sessions (Start, Interim-Update, Stop)
 - CoA and Disconnect
-- Latency percentiles and reporting
+- Vendor-specific attributes and loading dictionary files
+- Retransmission during a load run; a request that goes unanswered is counted
+  as lost rather than retried
+- Live progress output; a run reports once it finishes
 - The web interface
 
 ## Why it exists
@@ -59,6 +64,31 @@ make lint       # golangci-lint run
 ```
 
 ## Usage
+
+### Load
+
+```sh
+radblaster run -server 10.0.0.1:1812 \
+               -user 'subscriber{n}@example.net' \
+               -password secret \
+               -rate 5000 -duration 60s
+```
+
+`{n}` in the username is replaced with the request number, so each request
+authenticates a different subscriber. Omit `-rate` to offer load as fast as the
+sockets allow, and use `-count` instead of `-duration` to bound a run by
+requests rather than time.
+
+Concurrency comes from sockets, not threads. The RADIUS identifier is one octet
+wide, so a single source port can only carry 256 requests at a time; `-sockets`
+sets how many ports to spread across. If a run is limited by this rather than by
+the server, it says so and tells you the ceiling it hit.
+
+Two latency columns are reported. The one measured from the scheduled send
+includes any time the generator spent falling behind its own schedule, and is
+the honest figure for what a subscriber would experience. The one measured from
+the actual send is what the server took. When they diverge, the run could not
+keep pace and the result understates the load the server was asked to handle.
 
 ### Single authentication
 

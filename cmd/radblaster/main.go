@@ -28,10 +28,11 @@ func usage() {
 	fmt.Fprint(os.Stderr, `radblaster tests RADIUS authentication and accounting infrastructure.
 
 Usage:
+  radblaster run [flags]      offer sustained load and report the result
   radblaster auth [flags]     send one Access-Request and report the reply
   radblaster version          print the build version
 
-Run "radblaster auth -h" for the authentication flags.
+Run "radblaster <command> -h" for the flags of a command.
 `)
 }
 
@@ -42,6 +43,8 @@ func run(args []string) error {
 	}
 
 	switch args[0] {
+	case "run":
+		return runLoad(args[1:])
 	case "auth":
 		return runAuth(args[1:])
 	case "version":
