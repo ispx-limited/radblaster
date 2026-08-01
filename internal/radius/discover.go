@@ -28,21 +28,52 @@ var wellKnownDictionaries = []string{
 // point it somewhere real rather than depending on what is installed.
 var searchPaths = wellKnownDictionaries
 
-// DiscoverDictionaries returns the well-known dictionary paths that exist on
-// this machine, most conventional first.
+// radiusManifest is where the RADIUS protocol's own manifest sits inside an
+// installed dictionary tree.
+const radiusManifest = "radius/dictionary"
+
+// DiscoverDictionaries returns a loadable dictionary for each well-known
+// location present on this machine, most conventional first.
+//
+// A location may be either a file or a directory depending on how the
+// installation lays them out. When it is a directory it holds one subtree per
+// protocol, and only the RADIUS one may be loaded: the protocols number their
+// attributes independently, so pulling in the others would put a DHCP option 1
+// in the same namespace as User-Name. The manifest inside that subtree is
+// preferred over the files beside it, because it includes them in a deliberate
+// order that decides which definition wins.
 func DiscoverDictionaries() []string {
 	var found []string
 	for _, p := range searchPaths {
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			// Absolute, so a path written into a profile still resolves when
-			// that profile is run from somewhere else.
-			if a, err := filepath.Abs(p); err == nil {
-				p = a
-			}
-			found = append(found, p)
+		resolved, ok := resolveDictionary(p)
+		if !ok {
+			continue
 		}
+		// Absolute, so a path written into a profile still resolves when that
+		// profile is run from somewhere else.
+		if a, err := filepath.Abs(resolved); err == nil {
+			resolved = a
+		}
+		found = append(found, resolved)
 	}
 	return found
+}
+
+// resolveDictionary turns a candidate location into something safe to load.
+func resolveDictionary(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if !info.IsDir() {
+		return path, true
+	}
+	manifest := filepath.Join(path, radiusManifest)
+	if mi, err := os.Stat(manifest); err == nil && !mi.IsDir() {
+		return manifest, true
+	}
+	// A directory with no RADIUS subtree is not something to guess at.
+	return "", false
 }
 
 // LoadDiscovered loads whatever dictionaries are already on the machine,

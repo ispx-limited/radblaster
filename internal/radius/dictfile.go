@@ -122,6 +122,16 @@ func (d *Dictionary) parse(r io.Reader, path string, depth int) error {
 		}
 
 		switch strings.ToUpper(fields[0]) {
+		case "BEGIN":
+			// A dictionary set covers several protocols, each numbering its
+			// attributes independently. Loading another protocol's file would
+			// put its option 1 in the same namespace as User-Name, so a file
+			// that declares itself as anything but RADIUS is skipped whole.
+			if len(fields) >= 3 && strings.EqualFold(fields[1], "PROTOCOL") &&
+				!strings.EqualFold(fields[2], "RADIUS") {
+				return nil
+			}
+
 		case "$INCLUDE":
 			if len(fields) < 2 {
 				return dictErr(path, line, "$INCLUDE needs a file")

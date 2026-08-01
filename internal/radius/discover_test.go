@@ -62,24 +62,6 @@ func TestDiscoverFindsNothingWhenNothingIsInstalled(t *testing.T) {
 	}
 }
 
-// TestDiscoverIgnoresDirectories guards against picking up a directory that
-// happens to sit where a dictionary file usually does.
-func TestDiscoverIgnoresDirectories(t *testing.T) {
-	dir := t.TempDir()
-	asDir := filepath.Join(dir, "dictionary")
-	if err := os.Mkdir(asDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-
-	old := searchPaths
-	searchPaths = []string{asDir}
-	t.Cleanup(func() { searchPaths = old })
-
-	if found := DiscoverDictionaries(); len(found) != 0 {
-		t.Errorf("found %v, want none", found)
-	}
-}
-
 func TestSearch(t *testing.T) {
 	d := loadTestDict(t)
 
@@ -175,5 +157,100 @@ func TestSearchDistinguishesVendorsSharingAName(t *testing.T) {
 			t.Errorf("%q appears more than once, so the list cannot tell them apart", m.Name)
 		}
 		seen[m.Name] = true
+	}
+}
+
+// TestDiscoverHandlesAnInstalledTree covers the layout an installation
+// actually leaves behind: a directory holding one subtree per protocol, not a
+// single file.
+func TestDiscoverHandlesAnInstalledTree(t *testing.T) {
+	root := t.TempDir()
+	installed := filepath.Join(root, "dictionary")
+	radiusDir := filepath.Join(installed, "radius")
+	dhcpDir := filepath.Join(installed, "dhcpv4")
+	for _, d := range []string{radiusDir, dhcpDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	write := func(path, body string) {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+	write(filepath.Join(radiusDir, "dictionary"),
+		"BEGIN PROTOCOL RADIUS 1\n$INCLUDE dictionary.site\n")
+	write(filepath.Join(radiusDir, "dictionary.site"),
+		"ATTRIBUTE Site-Tag 200 string\n")
+	// Another protocol reusing low attribute numbers, which must not be
+	// pulled in: its option 1 is not User-Name.
+	write(filepath.Join(dhcpDir, "dictionary"),
+		"BEGIN PROTOCOL DHCPv4 4\nATTRIBUTE Option-Request 1 octets\n")
+
+	old := searchPaths
+	searchPaths = []string{installed}
+	t.Cleanup(func() { searchPaths = old })
+
+	found := DiscoverDictionaries()
+	if len(found) != 1 {
+		t.Fatalf("found %v, want the RADIUS manifest", found)
+	}
+	if filepath.Base(filepath.Dir(found[0])) != "radius" {
+		t.Errorf("found %q, want the manifest inside the radius subtree", found[0])
+	}
+
+	d, _, err := LoadDiscovered()
+	if err != nil {
+		t.Fatalf("LoadDiscovered: %v", err)
+	}
+	if d.ByName("Site-Tag") == nil {
+		t.Error("the RADIUS dictionary was not loaded")
+	}
+	if d.ByName("Option-Request") != nil {
+		t.Error("another protocol's attributes leaked into the RADIUS namespace")
+	}
+	if def := d.ByNumber(1); def == nil || def.Name != "User-Name" {
+		t.Errorf("attribute 1 is %v, want User-Name; another protocol overwrote it", def)
+	}
+}
+
+// TestLoadIgnoresOtherProtocols guards the namespace however the file is
+// reached, including someone pointing at the tree root by hand.
+func TestLoadIgnoresOtherProtocols(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dictionary.dhcpv4")
+	body := "BEGIN PROTOCOL DHCPv4 4\nATTRIBUTE Option-Request 1 octets\nATTRIBUTE Subnet-Mask 2 ipaddr\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+
+	d, err := LoadDictionary(path)
+	if err != nil {
+		t.Fatalf("LoadDictionary: %v", err)
+	}
+	if d.ByName("Option-Request") != nil {
+		t.Error("a DHCP attribute was loaded into the RADIUS namespace")
+	}
+	if def := d.ByNumber(2); def == nil || def.Name != "User-Password" {
+		t.Errorf("attribute 2 is %v, want User-Password", def)
+	}
+}
+
+// TestDiscoverSkipsADirectoryWithNoRadiusSubtree keeps discovery from guessing
+// at a directory it does not recognise.
+func TestDiscoverSkipsADirectoryWithNoRadiusSubtree(t *testing.T) {
+	root := t.TempDir()
+	empty := filepath.Join(root, "dictionary")
+	if err := os.MkdirAll(filepath.Join(empty, "tacacs"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	old := searchPaths
+	searchPaths = []string{empty}
+	t.Cleanup(func() { searchPaths = old })
+
+	if found := DiscoverDictionaries(); len(found) != 0 {
+		t.Errorf("found %v, want none", found)
 	}
 }
