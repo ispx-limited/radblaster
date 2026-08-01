@@ -1,6 +1,9 @@
 package radius
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // AttrType is a RADIUS attribute number.
 type AttrType uint8
@@ -93,12 +96,18 @@ type AttrDef struct {
 	Type AttrType
 	// Vendor is zero for a standard attribute and the vendor's identifier
 	// for one carried inside a Vendor-Specific attribute.
-	Vendor  uint32
-	Name    string
-	Data    DataType
-	Encrypt Encryption
-	HasTag  bool
-	Values  []Value
+	Vendor uint32
+	// Name is the name as the dictionary file wrote it, which for a vendor
+	// attribute may be bare. Qualified is the name that actually resolves,
+	// and is what an interface must show: offering a bare name would suggest
+	// something that does not parse, and two vendors' identically named
+	// attributes would be indistinguishable.
+	Name      string
+	Qualified string
+	Data      DataType
+	Encrypt   Encryption
+	HasTag    bool
+	Values    []Value
 }
 
 // standardAttrs is the built-in attribute set. It is deliberately limited to
@@ -216,6 +225,7 @@ func newStandardDictionary() *Dictionary {
 	}
 	for i := range standardAttrs {
 		def := &standardAttrs[i]
+		def.Qualified = def.Name
 		d.byNumber[def.Type] = def
 		d.byName[strings.ToLower(def.Name)] = def
 	}
@@ -248,4 +258,81 @@ func (a *AttrDef) ValueName(n uint32) string {
 		}
 	}
 	return ""
+}
+
+// Match is one result of searching the dictionary.
+type Match struct {
+	Name   string   `json:"name"`
+	Vendor uint32   `json:"vendor,omitempty"`
+	Type   AttrType `json:"type"`
+	// Data is the declared wire type, so an interface can hint at what a
+	// value should look like.
+	Data DataType `json:"data"`
+	// Values are the named constants for an integer attribute, which are what
+	// an operator actually wants to pick from.
+	Values []string `json:"values,omitempty"`
+}
+
+// Search finds attributes whose name contains q, case-insensitively.
+//
+// Names that start with q come first, because someone typing "cisco" wants the
+// Cisco attributes before every attribute that merely mentions it.
+func (d *Dictionary) Search(q string, limit int) []Match {
+	if limit <= 0 {
+		limit = 50
+	}
+	q = strings.ToLower(strings.TrimSpace(q))
+
+	var prefix, contains []*AttrDef
+	seen := make(map[*AttrDef]bool)
+	for name, def := range d.byName {
+		if seen[def] {
+			continue
+		}
+		switch {
+		case q == "":
+			seen[def] = true
+			prefix = append(prefix, def)
+		case strings.HasPrefix(name, q):
+			seen[def] = true
+			prefix = append(prefix, def)
+		case strings.Contains(name, q):
+			seen[def] = true
+			contains = append(contains, def)
+		}
+		if len(prefix) > limit*4 {
+			break
+		}
+	}
+
+	byName := func(a, b *AttrDef) int { return strings.Compare(a.Name, b.Name) }
+	slices.SortFunc(prefix, byName)
+	slices.SortFunc(contains, byName)
+
+	out := make([]Match, 0, limit)
+	for _, def := range append(prefix, contains...) {
+		if len(out) >= limit {
+			break
+		}
+		name := def.Qualified
+		if name == "" {
+			name = def.Name
+		}
+		m := Match{Name: name, Vendor: def.Vendor, Type: def.Type, Data: def.Data}
+		for _, v := range def.Values {
+			m.Values = append(m.Values, v.Name)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// Count returns how many attributes and vendors the dictionary knows, which is
+// what an interface reports after loading.
+func (d *Dictionary) Count() (attrs, vendors int) {
+	seen := make(map[*AttrDef]bool)
+	for _, def := range d.byName {
+		seen[def] = true
+	}
+	return len(seen), len(d.vendorIDs)
 }

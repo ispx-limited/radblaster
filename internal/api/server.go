@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -31,9 +32,10 @@ const maxSamples = 1200
 // identifier space and the source ports, so their results would interfere in
 // ways that are invisible in the numbers.
 type Server struct {
-	dict     *radius.Dictionary
-	ui       fs.FS
-	profiles *profile.Store
+	dict      *radius.Dictionary
+	dictPaths []string
+	ui        fs.FS
+	profiles  *profile.Store
 
 	mu      sync.Mutex
 	state   State
@@ -69,6 +71,10 @@ func New(dict *radius.Dictionary, ui fs.FS, profiles *profile.Store) *Server {
 	}
 }
 
+// SetDictionaryPaths records where the loaded dictionaries came from, so the
+// interface can report them and a saved profile can pin them.
+func (s *Server) SetDictionaryPaths(paths []string) { s.dictPaths = paths }
+
 // Handler returns the routes the interface is served on.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -76,6 +82,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/run", s.stopRun)
 	mux.HandleFunc("GET /api/status", s.getStatus)
 	mux.HandleFunc("GET /api/events", s.stream)
+	mux.HandleFunc("GET /api/dictionary", s.dictionaryInfo)
+	mux.HandleFunc("GET /api/attributes", s.searchAttributes)
 	mux.HandleFunc("GET /api/profiles", s.listProfiles)
 	mux.HandleFunc("GET /api/profiles/{name}", s.getProfile)
 	mux.HandleFunc("PUT /api/profiles/{name}", s.putProfile)
@@ -451,4 +459,34 @@ func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// dictionaryInfo reports what names are resolvable and where they came from.
+// Discovery is convenient, but a run that has to be repeatable should not
+// depend on what happened to be installed, so the paths are always visible and
+// are written into a profile when one is saved.
+func (s *Server) dictionaryInfo(w http.ResponseWriter, _ *http.Request) {
+	attrs, vendors := s.dict.Count()
+	paths := s.dictPaths
+	if paths == nil {
+		paths = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"paths":      paths,
+		"attributes": attrs,
+		"vendors":    vendors,
+	})
+}
+
+// searchAttributes backs the name suggestions in the interface.
+func (s *Server) searchAttributes(w http.ResponseWriter, r *http.Request) {
+	limit := 40
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"matches": s.dict.Search(r.URL.Query().Get("q"), limit),
+	})
 }

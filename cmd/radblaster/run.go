@@ -68,6 +68,7 @@ func runLoad(args []string) error {
 		seed = fs.Uint64("seed", 0, "seed for a reproducible run; 0 draws a fresh one")
 	)
 	profilePath := fs.String("profile", "", "profile file to take settings from; flags override it")
+	noAutoDict := fs.Bool("no-auto-dictionary", false, "do not look for dictionaries in the usual system locations")
 	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
 	fs.Var(&attrs, "attr", "extra attribute as Name=value, repeatable; {n} is the session number")
 	fs.Usage = func() {
@@ -129,13 +130,11 @@ func runLoad(args []string) error {
 		*acct += ":1813"
 	}
 
-	dict := radius.StandardDictionary()
-	if len(dicts) > 0 {
-		var err error
-		if dict, err = radius.LoadDictionary(dicts...); err != nil {
-			return err
-		}
+	dict, dictPaths, err := loadDictionaries(dicts, *noAutoDict)
+	if err != nil {
+		return err
 	}
+	reportDictionaries(dict, dictPaths)
 	specs := make([]radius.AttrSpec, 0, len(attrs))
 	for _, a := range attrs {
 		spec, err := dict.ParseSpec(a)

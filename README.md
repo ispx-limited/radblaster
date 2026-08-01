@@ -217,9 +217,10 @@ an estate that uses vendor attributes is not fully described without them.
 ### Vendor attributes
 
 radblaster ships definitions for the RFC attributes only. For vendor
-attributes, point it at the dictionary files your RADIUS server already uses,
-so both ends resolve the same names to the same numbers and there is no version
-skew between them:
+attributes it looks in the usual system locations, so on a machine that already
+runs RADIUS the dictionaries are found without being asked for. Point
+`-dictionary` at them explicitly to override that, or pass
+`-no-auto-dictionary` to use only the built-in set:
 
 ```sh
 radblaster run -server 10.0.0.1:1812 -password secret -count 1000 \
@@ -229,7 +230,13 @@ radblaster run -server 10.0.0.1:1812 -password secret -count 1000 \
 ```
 
 Both the friendly and the qualified name work (`Cisco-AVPair` or
-`Cisco.AVPair`), because dictionaries differ on which they use.
+`Cisco.AVPair`), because dictionaries differ on which they use. In the web
+interface the name field suggests from whatever is loaded, and an attribute
+with named values offers those too.
+
+What was loaded is always reported, and saving a profile records the paths, so
+a run that has to be repeatable does not depend on what happened to be
+installed on the machine that ran it.
 
 A dictionary is a convenience, not a requirement. Any attribute can be written
 by number, which means nothing has to be installed for a one-off test:

@@ -179,6 +179,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+export interface AttrMatch {
+  name: string;
+  vendor?: number;
+  type: number;
+  data: number;
+  values?: string[];
+}
+
+export interface DictionaryInfo {
+  paths: string[];
+  attributes: number;
+  vendors: number;
+}
+
 export interface ProfileList {
   profiles: string[];
   dir: string;
@@ -186,6 +200,9 @@ export interface ProfileList {
 
 export const api = {
   status: () => request<Status>("api/status"),
+  dictionary: () => request<DictionaryInfo>("api/dictionary"),
+  attributes: (q: string) =>
+    request<{ matches: AttrMatch[] }>(`api/attributes?q=${encodeURIComponent(q)}&limit=40`),
   profiles: () => request<ProfileList>("api/profiles"),
   loadProfile: (name: string) =>
     request<{ config: Record<string, unknown> }>(`api/profiles/${encodeURIComponent(name)}`),

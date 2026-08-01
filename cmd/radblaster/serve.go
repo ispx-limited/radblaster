@@ -13,7 +13,6 @@ import (
 
 	"github.com/ispx-limited/radblaster/internal/api"
 	"github.com/ispx-limited/radblaster/internal/profile"
-	"github.com/ispx-limited/radblaster/internal/radius"
 	"github.com/ispx-limited/radblaster/internal/web"
 )
 
@@ -22,6 +21,7 @@ func runServe(args []string) error {
 	var (
 		addr     = fs.String("addr", "127.0.0.1:8080", "address to serve the interface on")
 		profiles = fs.String("profiles", "profiles", "directory to keep saved profiles in")
+		noAuto   = fs.Bool("no-auto-dictionary", false, "do not look for dictionaries in the usual system locations")
 		dicts    stringList
 	)
 	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
@@ -36,12 +36,9 @@ func runServe(args []string) error {
 		return err
 	}
 
-	dict := radius.StandardDictionary()
-	if len(dicts) > 0 {
-		var err error
-		if dict, err = radius.LoadDictionary(dicts...); err != nil {
-			return err
-		}
+	dict, dictPaths, err := loadDictionaries(dicts, *noAuto)
+	if err != nil {
+		return err
 	}
 
 	store, err := profile.NewStore(*profiles)
@@ -50,12 +47,15 @@ func runServe(args []string) error {
 	}
 
 	srv := api.New(dict, web.FS(), store)
+	srv.SetDictionaryPaths(dictPaths)
 	defer srv.Close()
 
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	reportDictionaries(dict, dictPaths)
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {

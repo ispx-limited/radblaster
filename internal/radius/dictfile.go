@@ -270,6 +270,7 @@ func (d *Dictionary) addVendor(name string, id uint32) {
 // silently shadowing a standard one of the same name.
 func (d *Dictionary) addAttr(def *AttrDef) {
 	if def.Vendor == 0 {
+		def.Qualified = def.Name
 		d.byName[strings.ToLower(def.Name)] = def
 		return
 	}
@@ -295,6 +296,7 @@ func (d *Dictionary) addAttr(def *AttrDef) {
 	if !strings.HasPrefix(strings.ToLower(friendly), strings.ToLower(vendor)+"-") {
 		friendly = vendor + "-" + def.Name
 	}
+	def.Qualified = friendly
 	d.byName[strings.ToLower(friendly)] = def
 }
 

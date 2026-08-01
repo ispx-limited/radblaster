@@ -7,7 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Field, Row } from "@/components/field";
 import { AttrEditor } from "@/components/attr-editor";
-import { api, ApiError, fromWire, toWire, type RunConfig, type State } from "@/lib/api";
+import { api, ApiError, fromWire, toWire, type DictionaryInfo, type RunConfig, type State } from "@/lib/api";
 
 export function ProfilePanel({
   cfg,
@@ -28,6 +28,7 @@ export function ProfilePanel({
   const [selected, setSelected] = useState("");
   const [name, setName] = useState("");
   const [msg, setMsg] = useState<{ text: string; bad?: boolean }>();
+  const [dict, setDict] = useState<DictionaryInfo>();
 
   const refresh = () =>
     api
@@ -40,6 +41,7 @@ export function ProfilePanel({
 
   useEffect(() => {
     void refresh();
+    api.dictionary().then(setDict).catch(() => {});
   }, []);
 
   async function save() {
@@ -259,12 +261,28 @@ export function ProfilePanel({
           <CardHeader className="pb-4">
             <CardTitle className="text-sm font-semibold">Extra attributes</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             <AttrEditor
               value={cfg.attributes}
               onChange={(attributes) => set({ attributes })}
               disabled={running}
             />
+            {dict ? (
+              <p className="border-t border-border/60 pt-3 text-[11px] leading-relaxed text-muted-foreground/70">
+                {dict.paths.length === 0 ? (
+                  <>
+                    Only the built-in RFC attributes are loaded. Point{" "}
+                    <span className="font-mono">-dictionary</span> at the files your RADIUS server
+                    already uses, or write vendor attributes by number.
+                  </>
+                ) : (
+                  <>
+                    {dict.attributes.toLocaleString()} attributes across {dict.vendors} vendors,
+                    from {dict.paths.join(", ")}.
+                  </>
+                )}
+              </p>
+            ) : null}
           </CardContent>
         </Card>
 
