@@ -2,10 +2,8 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -315,136 +313,6 @@ func (r *Result) Accounting() bool {
 		}
 	}
 	return false
-}
-
-// Run drives the configured load and returns once the run is complete or ctx
-// is cancelled.
-func Run(ctx context.Context, cfg Config) (*Result, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
-
-	seed := cfg.Seed
-	if seed == 0 {
-		seed = rand.Uint64()
-	}
-	runID := uint32(seed)
-
-	reg := newRegistry()
-
-	// The dynamic authorisation listener makes this behave like an access node
-	// the server can push changes to, which is the only way to test whether a
-	// bulk policy change or a mass disconnect actually lands.
-	var da *dynauth
-	if cfg.CoAListen != "" {
-		var err error
-		if da, err = newDynAuth(cfg.CoAListen, cfg.Secret, reg); err != nil {
-			return nil, err
-		}
-		defer da.close()
-	}
-
-	n := cfg.links()
-	shards := make([]*shard, 0, n)
-	for i := 0; i < n; i++ {
-		// Each shard derives its own stream from the run seed, so the run is
-		// reproducible without the shards having to coordinate.
-		r := rand.New(rand.NewPCG(seed, uint64(i)))
-		s, err := newShard(&cfg, i, n, runID, r, reg)
-		if err != nil {
-			for _, done := range shards {
-				done.close()
-			}
-			return nil, err
-		}
-		shards = append(shards, s)
-	}
-	defer func() {
-		for _, s := range shards {
-			s.close()
-		}
-	}()
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	if cfg.Duration > 0 {
-		var stop context.CancelFunc
-		runCtx, stop = context.WithTimeout(runCtx, cfg.Duration)
-		defer stop()
-	}
-
-	// Session numbers are handed out globally so every session gets a
-	// distinct subscriber, whichever link carries it.
-	seq := &counter{limit: cfg.Count}
-
-	started := time.Now()
-
-	var daWG sync.WaitGroup
-	if da != nil {
-		da.shards = shards
-		daWG.Add(1)
-		go func() {
-			defer daWG.Done()
-			da.serve(runCtx)
-		}()
-	}
-
-	var wg sync.WaitGroup
-	for _, s := range shards {
-		wg.Add(1)
-		go func(s *shard) {
-			defer wg.Done()
-			s.run(runCtx, started, seq)
-		}(s)
-	}
-	wg.Wait()
-
-	if da != nil {
-		// Close first so the listener's pending read returns immediately
-		// rather than waiting out its deadline.
-		da.close()
-		daWG.Wait()
-	}
-
-	elapsed := time.Since(started)
-
-	res := &Result{
-		Elapsed:     elapsed,
-		Links:       n,
-		OfferedRate: cfg.Rate,
-	}
-	for e := range res.Exchanges {
-		res.Exchanges[e] = newMetrics(Exchange(e).String())
-	}
-	var setupEnd time.Time
-	for _, s := range shards {
-		s.mu.Lock()
-		for e := range res.Exchanges {
-			res.Exchanges[e].merge(s.metrics[e])
-		}
-		res.SessionsStarted += s.sessionsStarted
-		res.SessionsCompleted += s.sessionsCompleted
-		if s.lastSetupAt.After(setupEnd) {
-			setupEnd = s.lastSetupAt
-		}
-		s.mu.Unlock()
-	}
-
-	// Measure the setup rate over the window sessions were actually being
-	// established in. Dividing by the whole run would understate it whenever
-	// sessions are held online afterwards, because most of that time is spent
-	// deliberately not setting anything up.
-	if da != nil {
-		res.DynAuth = da.snapshot()
-	}
-
-	res.SetupWindow = setupEnd.Sub(started)
-	if res.SetupWindow > 0 {
-		res.AchievedRate = float64(res.Access().Sent) / res.SetupWindow.Seconds()
-	} else if elapsed > 0 {
-		res.AchievedRate = float64(res.Access().Sent) / elapsed.Seconds()
-	}
-	return res, nil
 }
 
 // counter hands out session sequence numbers across shards.

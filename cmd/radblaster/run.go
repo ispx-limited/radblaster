@@ -160,7 +160,13 @@ func runLoad(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "Offering load to %s. Press Ctrl-C to stop.\n\n", *server)
 
-	res, err := engine.Run(ctx, cfg)
+	runner, err := engine.Start(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	showProgress(os.Stderr, runner, cfg.AcctServer != "")
+
+	res, err := runner.Wait()
 	if err != nil {
 		return err
 	}

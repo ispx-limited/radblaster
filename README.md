@@ -48,11 +48,12 @@ What works:
   at all
 - **Retransmission**, repeating the exact bytes so a server can recognise the
   duplicate, with the retry count reported because retries otherwise hide loss
+- A live status line while a run is going, showing the outstanding request
+  count, which moves before any latency figure does
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- Live progress output; a run reports once it finishes
 - The web interface
 
 ## Why it exists
