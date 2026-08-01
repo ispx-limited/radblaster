@@ -11,17 +11,42 @@ import (
 // AttrName returns a human-readable name for t, falling back to the bare
 // number when the dictionary does not define it.
 func (d *Dictionary) AttrName(t AttrType) string {
-	if def := d.ByNumber(t); def != nil {
+	return d.VendorAttrName(0, t)
+}
+
+// VendorAttrName names an attribute, which for a vendor attribute means the
+// vendor as well when the dictionary knows it.
+func (d *Dictionary) VendorAttrName(vendor uint32, t AttrType) string {
+	if def := d.lookup(vendor, t); def != nil {
 		return def.Name
 	}
-	return "Unknown-" + strconv.Itoa(int(t))
+	if vendor == 0 {
+		return "Unknown-" + strconv.Itoa(int(t))
+	}
+	if name := d.VendorName(vendor); name != "" {
+		return name + "-" + strconv.Itoa(int(t))
+	}
+	return "Vendor-" + strconv.FormatUint(uint64(vendor), 10) + "-" + strconv.Itoa(int(t))
+}
+
+func (d *Dictionary) lookup(vendor uint32, t AttrType) *AttrDef {
+	if vendor == 0 {
+		return d.ByNumber(t)
+	}
+	return d.ByVendor(vendor, t)
 }
 
 // FormatValue renders v for display according to the attribute's data type.
 // Values that do not match the declared width fall back to hex, so a malformed
 // packet is still readable rather than being hidden behind an error.
 func (d *Dictionary) FormatValue(t AttrType, v []byte) string {
-	def := d.ByNumber(t)
+	return d.FormatVendorValue(0, t, v)
+}
+
+// FormatVendorValue renders a value for display, resolving the attribute
+// through its vendor when it has one.
+func (d *Dictionary) FormatVendorValue(vendor uint32, t AttrType, v []byte) string {
+	def := d.lookup(vendor, t)
 	if def == nil {
 		return fmt.Sprintf("%#x", v)
 	}
@@ -29,6 +54,18 @@ func (d *Dictionary) FormatValue(t AttrType, v []byte) string {
 	switch def.Data {
 	case TypeString:
 		return strconv.Quote(string(v))
+
+	case TypeByte:
+		if len(v) != 1 {
+			break
+		}
+		return strconv.FormatUint(uint64(v[0]), 10)
+
+	case TypeShort:
+		if len(v) != 2 {
+			break
+		}
+		return strconv.FormatUint(uint64(binary.BigEndian.Uint16(v)), 10)
 
 	case TypeInteger:
 		if len(v) != 4 {

@@ -43,9 +43,16 @@ var (
 )
 
 // Attribute is a single type-length-value triple.
+//
+// A non-zero Vendor makes it a vendor-specific attribute, carried on the wire
+// inside a Vendor-Specific attribute (type 26) as RFC 2865 section 5.26
+// describes. Modelling it as a field rather than making callers hand-build the
+// enclosing attribute keeps vendor and standard attributes the same shape
+// everywhere else.
 type Attribute struct {
-	Type  AttrType
-	Value []byte
+	Type   AttrType
+	Vendor uint32
+	Value  []byte
 }
 
 // Packet is a decoded RADIUS packet.
@@ -78,6 +85,27 @@ func (p *Packet) Add(t AttrType, v []byte) {
 	p.Attributes = append(p.Attributes, Attribute{Type: t, Value: v})
 }
 
+// AddVendor appends a vendor-specific attribute.
+func (p *Packet) AddVendor(vendor uint32, t AttrType, v []byte) {
+	p.Attributes = append(p.Attributes, Attribute{Type: t, Vendor: vendor, Value: v})
+}
+
+// AddVendorString appends a vendor-specific text attribute.
+func (p *Packet) AddVendorString(vendor uint32, t AttrType, v string) {
+	p.AddVendor(vendor, t, []byte(v))
+}
+
+// GetVendor returns the value of the first instance of a vendor attribute, or
+// nil if absent.
+func (p *Packet) GetVendor(vendor uint32, t AttrType) []byte {
+	for i := range p.Attributes {
+		if p.Attributes[i].Vendor == vendor && p.Attributes[i].Type == t {
+			return p.Attributes[i].Value
+		}
+	}
+	return nil
+}
+
 // AddString appends a text attribute.
 func (p *Packet) AddString(t AttrType, v string) {
 	p.Add(t, []byte(v))
@@ -93,7 +121,7 @@ func (p *Packet) AddUint32(t AttrType, v uint32) {
 // Get returns the value of the first instance of t, or nil if absent.
 func (p *Packet) Get(t AttrType) []byte {
 	for i := range p.Attributes {
-		if p.Attributes[i].Type == t {
+		if p.Attributes[i].Vendor == 0 && p.Attributes[i].Type == t {
 			return p.Attributes[i].Value
 		}
 	}
@@ -104,7 +132,7 @@ func (p *Packet) Get(t AttrType) []byte {
 func (p *Packet) GetAll(t AttrType) [][]byte {
 	var out [][]byte
 	for i := range p.Attributes {
-		if p.Attributes[i].Type == t {
+		if p.Attributes[i].Vendor == 0 && p.Attributes[i].Type == t {
 			out = append(out, p.Attributes[i].Value)
 		}
 	}
@@ -211,6 +239,13 @@ func (p *Packet) encode(dst, secret, respondTo []byte, mac, digest hash.Hash) ([
 			dst = append(dst, zeros[:]...)
 			continue
 		}
+		if a.Vendor != 0 {
+			var err error
+			if dst, err = appendVSA(dst, a); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		dst = append(dst, byte(a.Type), byte(len(a.Value)+2))
 		dst = append(dst, a.Value...)
 	}
@@ -292,7 +327,7 @@ func (e *Encoder) EncodeResponse(p *Packet, reqAuthenticator [AuthenticatorLen]b
 
 func (p *Packet) hasAttr(t AttrType) bool {
 	for i := range p.Attributes {
-		if p.Attributes[i].Type == t {
+		if p.Attributes[i].Vendor == 0 && p.Attributes[i].Type == t {
 			return true
 		}
 	}
@@ -326,10 +361,14 @@ func Decode(b []byte) (*Packet, error) {
 		if alen < 2 || i+alen > length {
 			return nil, ErrBadAttribute
 		}
-		p.Attributes = append(p.Attributes, Attribute{
-			Type:  AttrType(b[i]),
-			Value: b[i+2 : i+alen],
-		})
+		if AttrType(b[i]) == AttrVendorSpecific {
+			p.Attributes = appendVendorAttributes(p.Attributes, b[i+2:i+alen])
+		} else {
+			p.Attributes = append(p.Attributes, Attribute{
+				Type:  AttrType(b[i]),
+				Value: b[i+2 : i+alen],
+			})
+		}
 		i += alen
 	}
 	return p, nil

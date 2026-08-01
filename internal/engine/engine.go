@@ -7,11 +7,23 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ispx-limited/radblaster/internal/radius"
 	"github.com/ispx-limited/radblaster/internal/stats"
 )
+
+// extraAttr is a caller-supplied attribute ready to be added to a packet.
+//
+// A value with no template is encoded once at startup rather than for every
+// packet, which keeps a long list of static vendor attributes off the hot
+// path.
+type extraAttr struct {
+	spec   radius.AttrSpec
+	static []byte
+}
 
 // Auth selects how a subscriber proves its identity.
 type Auth string
@@ -74,6 +86,15 @@ type Config struct {
 	NASPortID        string
 	TerminateCause   uint32
 
+	// Attributes are extra attributes put on every request this run sends,
+	// which is how vendor-specific attributes get onto the wire. Values may
+	// contain {n}, substituted with the session number.
+	Attributes []radius.AttrSpec
+
+	// prepared holds Attributes with their values already encoded where they
+	// are constant, so the send path only renders the ones that vary.
+	prepared []extraAttr
+
 	// CoAListen is the address to accept CoA-Request and Disconnect-Request
 	// on, for example ":3799". Empty means the run does not present itself as
 	// an access node the server can push changes to.
@@ -127,6 +148,27 @@ func (c *Config) validate() error {
 		return fmt.Errorf("engine: unknown authentication method %q", c.Auth)
 	case c.accounting() && c.InterimInterval < 0:
 		return errors.New("engine: interim interval cannot be negative")
+	}
+	return c.prepareAttributes()
+}
+
+// prepareAttributes encodes the constant attribute values once and checks the
+// templated ones, so a value that cannot be encoded is reported at startup
+// rather than silently dropped from every packet.
+func (c *Config) prepareAttributes() error {
+	c.prepared = make([]extraAttr, 0, len(c.Attributes))
+	for _, spec := range c.Attributes {
+		e := extraAttr{spec: spec}
+		if !strings.Contains(spec.Value, "{n}") {
+			v, err := spec.EncodeValue(spec.Value)
+			if err != nil {
+				return err
+			}
+			e.static = v
+		} else if _, err := spec.EncodeValue(expandUsername(spec.Value, 1)); err != nil {
+			return err
+		}
+		c.prepared = append(c.prepared, e)
 	}
 	return nil
 }

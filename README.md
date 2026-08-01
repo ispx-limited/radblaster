@@ -43,11 +43,13 @@ What works:
   implied by the number of links and the server's response time
 - **Answers CoA-Request and Disconnect-Request** as an access node would, so a
   bulk policy change or a mass disconnect can be tested from the server side
+- **Vendor-specific attributes**, resolved by name from the dictionary files
+  your own RADIUS server already uses, or written by number with no dictionary
+  at all
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- Vendor-specific attributes and loading dictionary files
 - Retransmission during a load run; a request that goes unanswered is counted
   as lost rather than retried
 - Live progress output; a run reports once it finishes
@@ -117,6 +119,34 @@ includes any time the generator spent falling behind its own schedule, and is
 the honest figure for what a subscriber would experience. The one measured from
 the actual send is what the server took. When they diverge, the run could not
 keep pace and the result understates the load the server was asked to handle.
+
+### Vendor attributes
+
+radblaster ships definitions for the RFC attributes only. For vendor
+attributes, point it at the dictionary files your RADIUS server already uses,
+so both ends resolve the same names to the same numbers and there is no version
+skew between them:
+
+```sh
+radblaster run -server 10.0.0.1:1812 -password secret -count 1000 \
+               -dictionary /path/to/your/dictionary \
+               -attr 'Cisco-AVPair=ip:qos-policy-in=voice' \
+               -attr 'ADSL-Forum-Agent-Circuit-Id=eth 1/1/{n}'
+```
+
+Both the friendly and the qualified name work (`Cisco-AVPair` or
+`Cisco.AVPair`), because dictionaries differ on which they use.
+
+A dictionary is a convenience, not a requirement. Any attribute can be written
+by number, which means nothing has to be installed for a one-off test:
+
+```sh
+radblaster run ... -attr '26.9.1=ip:qos-policy-in=voice' -attr '26.4874.10=policy'
+```
+
+Values are templated the same way usernames are, so `{n}` becomes the session
+number. Integer attributes also accept the value names their dictionary
+defines, as in `-attr 'Service-Type=Framed-User'`.
 
 ### Change of authorisation and disconnect
 

@@ -1,0 +1,3 @@
+# Top-level manifest, mirroring how real dictionary sets are laid out.
+$INCLUDE dictionary.example
+$INCLUDE dictionary.acme

@@ -1,0 +1,11 @@
+VENDOR		Acme			0x1234
+
+BEGIN-VENDOR	Acme
+ATTRIBUTE	Acme-Circuit-Id		1	string
+# A construct outside the supported subset; the loader should skip it rather
+# than reject the whole file.
+ATTRIBUTE	Acme-Nested		2.3	tlv
+END-VENDOR	Acme
+
+# A standard attribute added on top of the built-in set.
+ATTRIBUTE	Site-Local-Tag		200	string

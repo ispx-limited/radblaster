@@ -208,6 +208,23 @@ func (s *session) addCommon(p *radius.Packet, cfg *Config) {
 		p.AddString(radius.AttrNASPortID, expandUsername(cfg.NASPortID, s.seq))
 	}
 	p.AddUint32(radius.AttrNASPort, uint32(s.seq))
+
+	for i := range cfg.prepared {
+		e := &cfg.prepared[i]
+		v := e.static
+		if v == nil {
+			// Templated, so it has to be rendered for this subscriber.
+			var err error
+			if v, err = e.spec.EncodeValue(expandUsername(e.spec.Value, s.seq)); err != nil {
+				continue
+			}
+		}
+		p.Attributes = append(p.Attributes, radius.Attribute{
+			Type:   e.spec.Type,
+			Vendor: e.spec.Vendor,
+			Value:  v,
+		})
+	}
 }
 
 // applyAccept takes the parts of an Access-Accept the session must carry

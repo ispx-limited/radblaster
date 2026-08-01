@@ -147,7 +147,9 @@ func runAuth(args []string) error {
 	dict := radius.StandardDictionary()
 	fmt.Printf("%s in %s\n", reply.Code, elapsed.Round(time.Microsecond))
 	for _, a := range reply.Attributes {
-		fmt.Printf("  %-24s %s\n", dict.AttrName(a.Type), dict.FormatValue(a.Type, a.Value))
+		fmt.Printf("  %-28s %s\n",
+			dict.VendorAttrName(a.Vendor, a.Type),
+			dict.FormatVendorValue(a.Vendor, a.Type, a.Value))
 	}
 
 	if reply.Code != radius.CodeAccessAccept {

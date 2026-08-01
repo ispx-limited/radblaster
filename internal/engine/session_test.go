@@ -447,3 +447,68 @@ func TestManySessionsCompleteTheirLifecycle(t *testing.T) {
 		t.Errorf("Accounting-Stop sent = %d, want 200", got)
 	}
 }
+
+// TestExtraAttributesReachTheWire covers the path vendor attributes take: a
+// caller names them, they are resolved through a dictionary, and they appear
+// on every request the session sends.
+func TestExtraAttributesReachTheWire(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	dict := radius.StandardDictionary()
+	specs := make([]radius.AttrSpec, 0, 3)
+	for _, s := range []string{
+		"9.1=ip:qos-policy-in=voice", // a vendor attribute by number
+		"3561.1=eth 1/1/{n}",         // templated per subscriber
+		"NAS-Port-Id=slot-{n}",       // a standard attribute, templated
+	} {
+		spec, err := dict.ParseSpec(s)
+		if err != nil {
+			t.Fatalf("ParseSpec(%q): %v", s, err)
+		}
+		specs = append(specs, spec)
+	}
+
+	cfg := sessionConfig(srv)
+	cfg.Count = 1
+	cfg.Hold = 80 * time.Millisecond
+	cfg.Attributes = specs
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	starts := srv.seen(acctStart)
+	if len(starts) != 1 {
+		t.Fatalf("saw %d Accounting-Start requests, want 1", len(starts))
+	}
+	p := starts[0]
+
+	if got := string(p.GetVendor(9, 1)); got != "ip:qos-policy-in=voice" {
+		t.Errorf("vendor 9 attribute 1 = %q, want the AV pair", got)
+	}
+	if got := string(p.GetVendor(3561, 1)); got != "eth 1/1/1" {
+		t.Errorf("vendor 3561 attribute 1 = %q, want the template rendered for session 1", got)
+	}
+	if got := string(p.Get(radius.AttrNASPortID)); got != "slot-1" {
+		t.Errorf("NAS-Port-Id = %q, want slot-1", got)
+	}
+}
+
+// TestBadExtraAttributeFailsAtStartup keeps a value that cannot be encoded
+// from being silently dropped from every packet in the run.
+func TestBadExtraAttributeFailsAtStartup(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	spec, err := radius.StandardDictionary().ParseSpec("Session-Timeout=not-a-number")
+	if err != nil {
+		t.Fatalf("ParseSpec: %v", err)
+	}
+
+	cfg := sessionConfig(srv)
+	cfg.Count = 1
+	cfg.Attributes = []radius.AttrSpec{spec}
+
+	if _, err := Run(context.Background(), cfg); err == nil {
+		t.Error("expected the run to be refused, not to drop the attribute silently")
+	}
+}

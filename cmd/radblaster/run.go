@@ -53,8 +53,13 @@ func runLoad(args []string) error {
 
 		coaListen = fs.String("coa-listen", "", "address to accept CoA and Disconnect on, for example :3799")
 
+		dicts stringList
+		attrs stringList
+
 		seed = fs.Uint64("seed", 0, "seed for a reproducible run; 0 draws a fresh one")
 	)
+	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
+	fs.Var(&attrs, "attr", "extra attribute as Name=value, repeatable; {n} is the session number")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Offer sustained RADIUS load and report the result.\n\nFlags:")
 		fs.PrintDefaults()
@@ -64,6 +69,11 @@ func runLoad(args []string) error {
 		fmt.Fprintln(os.Stderr, "Accounting-Stop. The shared secret is read from RADBLASTER_SECRET if")
 		fmt.Fprintln(os.Stderr, "-secret is not given, which keeps it out of the process list and the")
 		fmt.Fprintln(os.Stderr, "shell history.")
+		fmt.Fprintln(os.Stderr, "\nradblaster ships definitions for the RFC attributes only. For vendor")
+		fmt.Fprintln(os.Stderr, "attributes, point -dictionary at the dictionary files your own RADIUS")
+		fmt.Fprintln(os.Stderr, "server already uses, so both ends resolve the same names to the same")
+		fmt.Fprintln(os.Stderr, "numbers. Without a dictionary an attribute can still be written by")
+		fmt.Fprintln(os.Stderr, "number, as in -attr '26.9.1=ip:qos-policy-in=voice'.")
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -85,6 +95,22 @@ func runLoad(args []string) error {
 	}
 	if *acct != "" && !strings.Contains(*acct, ":") {
 		*acct += ":1813"
+	}
+
+	dict := radius.StandardDictionary()
+	if len(dicts) > 0 {
+		var err error
+		if dict, err = radius.LoadDictionary(dicts...); err != nil {
+			return err
+		}
+	}
+	specs := make([]radius.AttrSpec, 0, len(attrs))
+	for _, a := range attrs {
+		spec, err := dict.ParseSpec(a)
+		if err != nil {
+			return err
+		}
+		specs = append(specs, spec)
 	}
 
 	auth := engine.AuthPAP
@@ -122,6 +148,7 @@ func runLoad(args []string) error {
 		NASPortType:      uint32(*portType),
 		CallingStationID: *calling,
 		NASPortID:        *nasPortID,
+		Attributes:       specs,
 		CoAListen:        *coaListen,
 		Seed:             *seed,
 	}
@@ -143,6 +170,16 @@ func runLoad(args []string) error {
 	if res.Access().Answered() == 0 && res.Access().Sent > 0 {
 		return errors.New("no request was answered")
 	}
+	return nil
+}
+
+// stringList collects a flag that may be given more than once.
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
 	return nil
 }
 

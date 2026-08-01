@@ -69,6 +69,8 @@ const (
 	TypeIPv6Prefix                 // reserved octet, prefix length, prefix
 	TypeInteger                    // 32-bit unsigned, network byte order
 	TypeDate                       // 32-bit unsigned, seconds since the Unix epoch
+	TypeByte                       // 8-bit unsigned
+	TypeShort                      // 16-bit unsigned, network byte order
 )
 
 // Encryption describes the obfuscation applied to a value before transmission.
@@ -88,10 +90,14 @@ type Value struct {
 
 // AttrDef describes one attribute.
 type AttrDef struct {
-	Type    AttrType
+	Type AttrType
+	// Vendor is zero for a standard attribute and the vendor's identifier
+	// for one carried inside a Vendor-Specific attribute.
+	Vendor  uint32
 	Name    string
 	Data    DataType
 	Encrypt Encryption
+	HasTag  bool
 	Values  []Value
 }
 
@@ -183,9 +189,16 @@ var standardAttrs = []AttrDef{
 }
 
 // Dictionary resolves attribute names and numbers.
+//
+// The built-in set covers the RFC attributes only. Vendor attributes come from
+// dictionary files the operator already has, loaded at runtime, so both ends
+// of a test resolve the same names to the same numbers.
 type Dictionary struct {
-	byNumber [256]*AttrDef
-	byName   map[string]*AttrDef
+	byNumber   [256]*AttrDef
+	byName     map[string]*AttrDef
+	vendorIDs  map[string]uint32
+	vendorName map[uint32]string
+	byVendor   map[uint32]map[AttrType]*AttrDef
 }
 
 // StandardDictionary returns a dictionary containing the built-in RFC
@@ -195,7 +208,12 @@ func StandardDictionary() *Dictionary { return stdDict }
 var stdDict = newStandardDictionary()
 
 func newStandardDictionary() *Dictionary {
-	d := &Dictionary{byName: make(map[string]*AttrDef, len(standardAttrs))}
+	d := &Dictionary{
+		byName:     make(map[string]*AttrDef, len(standardAttrs)),
+		vendorIDs:  make(map[string]uint32),
+		vendorName: make(map[uint32]string),
+		byVendor:   make(map[uint32]map[AttrType]*AttrDef),
+	}
 	for i := range standardAttrs {
 		def := &standardAttrs[i]
 		d.byNumber[def.Type] = def
