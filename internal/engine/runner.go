@@ -252,11 +252,7 @@ func (r *Runner) Snapshot() Snapshot {
 		}
 		snap.SessionsStarted += s.sessionsStarted
 		snap.SessionsCompleted += s.sessionsCompleted
-		for _, sess := range s.sessions {
-			if sess.state == stateActive {
-				snap.SessionsOnline++
-			}
-		}
+		snap.SessionsOnline += s.online
 		for _, l := range []*link{s.auth, s.acct} {
 			if l != nil {
 				snap.Outstanding += radius.IDSpace - l.ids.Available()

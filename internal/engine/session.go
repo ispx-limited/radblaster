@@ -81,6 +81,12 @@ type session struct {
 
 	onlineAt time.Time
 	stopAt   time.Time
+
+	// online mirrors membership of the shard's online tally. Keeping it as a
+	// flag rather than deriving it from state means the count stays right
+	// however a session leaves, including a teardown that passes through an
+	// intermediate state on the way out.
+	online bool
 }
 
 // newSession prepares a subscriber that has not yet authenticated.

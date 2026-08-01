@@ -17,7 +17,7 @@ radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
 Early but useful. The full subscriber session lifecycle works end to end
 against a real RADIUS server, including server-initiated disconnects, and on a
 desktop machine authentication alone sustains over 100,000 requests per second.
-The web interface is not built yet.
+There is a web interface for driving runs and watching them happen.
 
 What works:
 
@@ -50,11 +50,14 @@ What works:
   duplicate, with the retry count reported because retries otherwise hide loss
 - A live status line while a run is going, showing the outstanding request
   count, which moves before any latency figure does
+- **A web interface** for setting up a run, watching it live and reading the
+  result, driven entirely through the same API the command line uses
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- The web interface
+- Saving and comparing past runs; each run stands alone
+- A downloadable report file
 
 ## Why it exists
 
@@ -79,6 +82,30 @@ make lint       # golangci-lint run
 ```
 
 ## Usage
+
+### The web interface
+
+```sh
+radblaster serve
+```
+
+Then open http://127.0.0.1:8080. Set a run up in the form, start it, and watch
+the rates, the latency percentiles and the outstanding request count move as it
+goes. Everything the interface can do goes through the same HTTP API, so
+nothing in the browser has a privileged path the command line lacks:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/run` | start a run |
+| `DELETE` | `/api/run` | stop the run |
+| `GET` | `/api/status` | the current picture |
+| `GET` | `/api/events` | the same, streamed as server-sent events |
+
+The interface binds to localhost by default. It can start a run against any
+server it can reach and has no authentication of its own, so putting it on a
+shared address hands that ability to anyone who can reach it. The shared secret
+is accepted but never returned, so a browser pointed at a running instance
+cannot read it back.
 
 ### Subscriber sessions
 

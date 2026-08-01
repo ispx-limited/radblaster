@@ -59,6 +59,12 @@ type shard struct {
 	metrics           [exchangeCount]*Metrics
 	sessionsStarted   uint64
 	sessionsCompleted uint64
+	// online is how many subscribers are up right now. It is kept as a
+	// counter under the lock rather than derived by walking the session map,
+	// both because a snapshot must not read session fields the owning
+	// goroutine writes without it, and because that walk would cost the
+	// length of the map every time anyone looked.
+	online uint64
 
 	// lastSetupAt is when this shard last authenticated a new session. The
 	// achieved setup rate is measured over the setup window rather than the
@@ -412,6 +418,10 @@ func (s *shard) step(sess *session, now time.Time) {
 
 		s.mu.Lock()
 		s.sessionsStarted++
+		if !sess.online {
+			sess.online = true
+			s.online++
+		}
 		s.mu.Unlock()
 
 		s.scheduleNext(sess, now)
@@ -458,6 +468,10 @@ func (s *shard) finish(sess *session, completed bool) {
 	}
 	s.mu.Lock()
 	delete(s.sessions, sess.index)
+	if sess.online {
+		sess.online = false
+		s.online--
+	}
 	if completed {
 		s.sessionsCompleted++
 	}
