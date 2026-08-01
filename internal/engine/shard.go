@@ -1,13 +1,9 @@
 package engine
 
 import (
+	"container/heap"
 	"context"
-	"errors"
-	"fmt"
 	"math/rand/v2"
-	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,119 +11,133 @@ import (
 	"github.com/ispx-limited/radblaster/internal/radius"
 )
 
-// sweepInterval bounds how often a shard looks for expired requests. Pending
-// requests are capped at 256 by the identifier space, so a full sweep is
-// cheap and a timer wheel would be machinery without a purpose.
+// sweepInterval bounds how often a shard looks for expired requests. Requests
+// outstanding on a link are capped at 256 by the identifier space, so a full
+// sweep is cheap and a timer wheel would be machinery without a purpose.
 const sweepInterval = 20 * time.Millisecond
 
-// pending is one outstanding request.
-type pending struct {
-	active bool
-	seq    uint64
-	auth   [radius.AuthenticatorLen]byte
-	// dueAt is when the request was scheduled to go out, deadline for the
-	// latency measurement. sentAt is when it actually did.
-	dueAt  time.Time
-	sentAt time.Time
-}
-
-// shard owns one source port, its identifier space, and the requests
-// outstanding on it.
+// shard owns a slice of the simulated subscribers, together with the sockets
+// their traffic goes out on.
 //
-// Concurrency comes from sockets rather than goroutines, because the RADIUS
-// identifier is only eight bits wide: one socket can carry at most 256
-// requests at a time regardless of how many goroutines push at it.
+// A session stays with one shard for its whole life, so its state is only ever
+// touched by that shard and no cross-shard coordination is needed.
 type shard struct {
 	cfg   *Config
 	index int
 	total int
+	runID uint32
+	rng   *rand.Rand
 
-	conn *net.UDPConn
-	enc  *radius.Encoder
-	rng  *rand.Rand
+	auth *link
+	acct *link
 
-	// stopped tells the receiver to finish. The run context is not enough on
-	// its own: a run bounded by request count completes without the context
-	// ever being cancelled, and the receiver would otherwise keep looping on
+	// stopped tells the receivers to finish. The run context is not enough on
+	// its own: a run bounded by session count completes without the context
+	// ever being cancelled, and a receiver would otherwise keep looping on
 	// read timeouts forever.
 	stopped atomic.Bool
 
-	// mu guards everything below. The critical sections are a few hundred
-	// nanoseconds and only two goroutines contend for them, so a mutex is
-	// cheaper here than the bookkeeping needed to avoid one.
-	mu      sync.Mutex
-	ids     *radius.IDPool
-	pending [radius.IDSpace]pending
-	metrics *Metrics
+	// mu guards everything below. The critical sections are short and only
+	// three goroutines contend for them, so a mutex is cheaper here than the
+	// bookkeeping needed to avoid one.
+	mu       sync.Mutex
+	sessions map[uint32]*session
+	due      sessionQueue
+	nextIdx  uint32
+
+	metrics           [exchangeCount]*Metrics
+	sessionsStarted   uint64
+	sessionsCompleted uint64
+
+	// lastSetupAt is when this shard last authenticated a new session. The
+	// achieved setup rate is measured over the setup window rather than the
+	// whole run, because a run that holds sessions online afterwards spends
+	// most of its time deliberately not setting anything up.
+	lastSetupAt time.Time
 }
 
-func newShard(cfg *Config, index, total int, r *rand.Rand) (*shard, error) {
-	addr, err := net.ResolveUDPAddr("udp", cfg.Server)
-	if err != nil {
-		return nil, fmt.Errorf("engine: resolving %s: %w", cfg.Server, err)
+func newShard(cfg *Config, index, total int, runID uint32, r *rand.Rand) (*shard, error) {
+	s := &shard{
+		cfg:      cfg,
+		index:    index,
+		total:    total,
+		runID:    runID,
+		rng:      r,
+		sessions: make(map[uint32]*session),
 	}
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return nil, fmt.Errorf("engine: opening socket to %s: %w", cfg.Server, err)
+	for e := range s.metrics {
+		s.metrics[e] = newMetrics(Exchange(e).String())
 	}
-	return &shard{
-		cfg:     cfg,
-		index:   index,
-		total:   total,
-		conn:    conn,
-		enc:     radius.NewEncoder(cfg.Secret),
-		rng:     r,
-		ids:     radius.NewIDPool(r),
-		metrics: newMetrics("Access-Request"),
-	}, nil
+
+	var err error
+	if s.auth, err = newLink(cfg.Server, cfg.Secret, r); err != nil {
+		return nil, err
+	}
+	if cfg.accounting() {
+		if s.acct, err = newLink(cfg.AcctServer, cfg.Secret, r); err != nil {
+			s.auth.close()
+			return nil, err
+		}
+	}
+	return s, nil
 }
 
 func (s *shard) close() {
-	if s.conn != nil {
-		_ = s.conn.Close()
-	}
+	s.auth.close()
+	s.acct.close()
 }
 
-// run offers load until ctx ends or the sequence counter is exhausted, then
-// waits out the timeout so replies still in flight are counted.
+// run sets sessions up until ctx ends or the counter is exhausted, then keeps
+// driving the ones already online until they finish.
 func (s *shard) run(ctx context.Context, started time.Time, seq *counter) {
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer close(done)
-		s.receive(ctx)
+		defer wg.Done()
+		s.receive(ctx, s.auth)
 	}()
+	if s.acct != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.receive(ctx, s.acct)
+		}()
+	}
 
-	s.send(ctx, started, seq)
+	s.loop(ctx, started, seq)
 
-	// Give outstanding requests their full timeout to be answered rather
-	// than recording them as losses we caused by stopping.
+	// Requests already on the wire deserve their full timeout to be answered.
+	// Stopping the moment the last one is sent would count the replies still
+	// in flight as losses this run caused itself.
 	s.drain(ctx)
 
 	s.stopped.Store(true)
-	_ = s.conn.SetReadDeadline(time.Now())
-	<-done
+	_ = s.auth.conn.SetReadDeadline(time.Now())
+	if s.acct != nil {
+		_ = s.acct.conn.SetReadDeadline(time.Now())
+	}
+	wg.Wait()
 
 	s.expireAll()
 }
 
-// interval is the gap between this shard's own sends, and phase staggers the
-// shards so they interleave instead of firing together.
+// schedule returns the gap between this shard's own session setups and the
+// offset that staggers it against the other shards.
 func (s *shard) schedule() (interval, phase time.Duration) {
 	if s.cfg.Rate <= 0 {
 		return 0, 0
 	}
-	perSecond := s.cfg.Rate
-	interval = time.Duration(float64(time.Second) * float64(s.total) / perSecond)
-	phase = time.Duration(float64(time.Second) * float64(s.index) / perSecond)
+	interval = time.Duration(float64(time.Second) * float64(s.total) / s.cfg.Rate)
+	phase = time.Duration(float64(time.Second) * float64(s.index) / s.cfg.Rate)
 	return interval, phase
 }
 
-func (s *shard) send(ctx context.Context, started time.Time, seq *counter) {
+func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 	interval, phase := s.schedule()
 	unpaced := interval == 0
 
-	var sent uint64
-	due := started.Add(phase)
+	var setups uint64
+	nextSetup := started.Add(phase)
 	lastSweep := started
 
 	for {
@@ -141,38 +151,35 @@ func (s *shard) send(ctx context.Context, started time.Time, seq *counter) {
 			lastSweep = now
 		}
 
-		// Send everything whose scheduled moment has arrived. The batch is
-		// bounded so a run that has fallen behind still returns to check the
-		// clock and the context rather than spinning.
+		// Drive every session whose next step has come due.
+		s.advanceDue(now)
+
+		// Offer new sessions whose setup moment has arrived.
 		const maxBatch = 256
 		batch := 0
 		blocked := false
-		for unpaced || !due.After(now) {
-			// Check for a free identifier before claiming a sequence number,
-			// so a request that cannot be offered does not consume part of a
-			// bounded run's budget.
-			if !s.hasIdentifier() {
-				s.countBlocked()
+		setupsDone := false
+		for unpaced || !nextSetup.After(now) {
+			if !s.canSetup() {
+				s.countBlocked(ExchangeAccess)
 				blocked = true
 				break
 			}
 			n, ok := seq.take()
 			if !ok {
-				return
+				setupsDone = true
+				break
 			}
-			// Unpaced runs have no schedule to be late against, so the
-			// request is due when it is sent. Passing the zero time asks
-			// offer to use its own send timestamp.
 			var dueAt time.Time
 			if !unpaced {
-				dueAt = due
+				dueAt = nextSetup
 			}
-			s.offer(n, dueAt)
-			sent++
+			s.startSession(n, dueAt)
+			setups++
 			batch++
 
 			if !unpaced {
-				due = started.Add(phase + time.Duration(sent)*interval)
+				nextSetup = started.Add(phase + time.Duration(setups)*interval)
 			}
 			if batch >= maxBatch {
 				break
@@ -182,30 +189,62 @@ func (s *shard) send(ctx context.Context, started time.Time, seq *counter) {
 			}
 		}
 
-		if blocked {
-			// Every identifier on this socket is outstanding, so offering
-			// more would only spin a core recording refusals. Wait for the
-			// receiver or the sweep to free one.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Millisecond):
+		// The run is over once no more sessions can be set up and every
+		// session already online has finished its lifecycle.
+		if (setupsDone || !seq.remaining()) && s.idle() {
+			return
+		}
+
+		s.wait(ctx, now, nextSetup, unpaced, blocked, setupsDone)
+	}
+}
+
+// wait sleeps until the next thing needs doing, bounded so the loop keeps
+// checking the context and sweeping for timeouts.
+func (s *shard) wait(ctx context.Context, now, nextSetup time.Time, unpaced, blocked, setupsDone bool) {
+	sleep := sweepInterval
+
+	switch {
+	case blocked:
+		// Every identifier is outstanding, so pushing harder would only spin
+		// a core recording refusals.
+		sleep = time.Millisecond
+	case unpaced && !setupsDone:
+		return
+	default:
+		if next, ok := s.nextDue(); ok {
+			if d := next.Sub(now); d < sleep {
+				sleep = d
 			}
-			continue
 		}
+		if !setupsDone {
+			if d := nextSetup.Sub(now); d >= 0 && d < sleep {
+				sleep = d
+			}
+		}
+	}
+	if sleep <= 0 {
+		return
+	}
 
-		if unpaced {
-			continue
-		}
+	timer := time.NewTimer(sleep)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
 
-		wait := time.Until(due)
-		if wait <= 0 {
-			continue
+// drain waits for outstanding requests to be answered or to time out.
+func (s *shard) drain(ctx context.Context) {
+	deadline := time.Now().Add(s.cfg.timeout())
+	for time.Now().Before(deadline) {
+		if s.pendingCount() == 0 {
+			return
 		}
-		if wait > sweepInterval {
-			wait = sweepInterval
-		}
-		timer := time.NewTimer(wait)
+		s.expire(time.Now())
+
+		timer := time.NewTimer(sweepInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -215,33 +254,144 @@ func (s *shard) send(ctx context.Context, started time.Time, seq *counter) {
 	}
 }
 
-// hasIdentifier reports whether this socket can carry another request.
-func (s *shard) hasIdentifier() bool {
+// pendingCount reports how many requests are awaiting a reply.
+func (s *shard) pendingCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ids.Available() > 0
+	n := 0
+	for _, l := range []*link{s.auth, s.acct} {
+		if l != nil {
+			n += radius.IDSpace - l.ids.Available()
+		}
+	}
+	return n
 }
 
-// countBlocked records that load could not be offered because every
-// identifier on this socket was outstanding. Keeping this visible matters: a
-// non-zero count means the run was limited by our own concurrency rather than
-// by the server, so the result understates what the server could take.
-func (s *shard) countBlocked() {
+// canSetup reports whether a new session can be authenticated right now.
+func (s *shard) canSetup() bool {
 	s.mu.Lock()
-	s.metrics.Blocked++
+	defer s.mu.Unlock()
+	return s.auth.available()
+}
+
+// idle reports whether the shard has no sessions left to drive.
+func (s *shard) idle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions) == 0
+}
+
+// nextDue returns when the earliest scheduled session step falls.
+func (s *shard) nextDue() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.due.Len() == 0 {
+		return time.Time{}, false
+	}
+	return s.due[0].nextAt, true
+}
+
+func (s *shard) countBlocked(e Exchange) {
+	s.mu.Lock()
+	s.metrics[e].Blocked++
 	s.mu.Unlock()
 }
 
-// offer builds and sends one Access-Request.
-//
-// dueAt is when the request was scheduled to go out, which is what latency is
-// measured against. A zero dueAt means there was no schedule, so the send time
-// is used instead.
-func (s *shard) offer(seq uint64, dueAt time.Time) {
+// startSession creates a subscriber and authenticates it.
+func (s *shard) startSession(seq uint64, dueAt time.Time) {
 	s.mu.Lock()
-	id, ok := s.ids.Get()
+	idx := s.nextIdx
+	s.nextIdx++
+	sess := newSession(idx, seq, s.cfg, s.runID)
+	s.sessions[idx] = sess
+	s.lastSetupAt = time.Now()
+	s.mu.Unlock()
+
+	s.sendAccess(sess, dueAt)
+}
+
+// advanceDue drives every session whose scheduled step has arrived.
+func (s *shard) advanceDue(now time.Time) {
+	for {
+		s.mu.Lock()
+		if s.due.Len() == 0 || s.due[0].nextAt.After(now) {
+			s.mu.Unlock()
+			return
+		}
+		sess := heap.Pop(&s.due).(*session)
+		s.mu.Unlock()
+
+		s.step(sess, now)
+	}
+}
+
+// step performs the session's next lifecycle action.
+func (s *shard) step(sess *session, now time.Time) {
+	switch sess.state {
+	case stateAcctStart:
+		sess.onlineAt = now
+		sess.stopAt = now.Add(s.cfg.Hold)
+		sess.state = stateActive
+		s.sendAcct(sess, ExchangeAcctStart, acctStart, sess.nextAt, now)
+
+		s.mu.Lock()
+		s.sessionsStarted++
+		s.mu.Unlock()
+
+		s.scheduleNext(sess, now)
+
+	case stateActive:
+		if !now.Before(sess.stopAt) {
+			sess.state = stateAcctStop
+			s.sendAcct(sess, ExchangeAcctStop, acctStop, sess.nextAt, now)
+			s.finish(sess, true)
+			return
+		}
+		s.sendAcct(sess, ExchangeAcctInterim, acctInterim, sess.nextAt, now)
+		s.scheduleNext(sess, now)
+
+	default:
+		s.finish(sess, false)
+	}
+}
+
+// scheduleNext queues the session's following step, which is either its next
+// interim update or its teardown, whichever comes first.
+func (s *shard) scheduleNext(sess *session, now time.Time) {
+	next := sess.stopAt
+	if sess.interim > 0 {
+		if t := now.Add(sess.interim); t.Before(next) {
+			next = t
+		}
+	}
+	if next.Before(now) {
+		next = now
+	}
+	sess.nextAt = next
+
+	s.mu.Lock()
+	heap.Push(&s.due, sess)
+	s.mu.Unlock()
+}
+
+// finish removes a session from the shard.
+func (s *shard) finish(sess *session, completed bool) {
+	sess.state = stateDone
+	s.mu.Lock()
+	delete(s.sessions, sess.index)
+	if completed {
+		s.sessionsCompleted++
+	}
+	s.mu.Unlock()
+}
+
+// sendAccess builds and sends the session's Access-Request.
+func (s *shard) sendAccess(sess *session, dueAt time.Time) {
+	s.mu.Lock()
+	id, ok := s.auth.ids.Get()
 	if !ok {
-		s.metrics.Blocked++
+		s.metrics[ExchangeAccess].Blocked++
+		delete(s.sessions, sess.index)
 		s.mu.Unlock()
 		return
 	}
@@ -249,46 +399,62 @@ func (s *shard) offer(seq uint64, dueAt time.Time) {
 
 	p, err := radius.New(radius.CodeAccessRequest, id)
 	if err != nil {
-		s.mu.Lock()
-		s.ids.Put(id)
-		s.metrics.Malformed++
-		s.mu.Unlock()
+		s.abort(s.auth, id, sess, ExchangeAccess)
+		return
+	}
+	if err := sess.buildAccess(p, s.cfg, s.rng); err != nil {
+		s.abort(s.auth, id, sess, ExchangeAccess)
 		return
 	}
 
-	username := expandUsername(s.cfg.Username, seq)
-	p.AddString(radius.AttrUserName, username)
+	sess.state = stateAuthenticating
+	s.transmit(s.auth, p, sess, ExchangeAccess, id, dueAt)
+}
 
-	switch s.cfg.Auth {
-	case AuthCHAP:
-		ident := uint8(s.rng.UintN(256))
-		// With no CHAP-Challenge attribute the request authenticator serves
-		// as the challenge, per RFC 2865 section 5.3.
-		resp := radius.CHAPPassword(ident, []byte(s.cfg.Password), p.Authenticator[:])
-		p.Add(radius.AttrCHAPPassword, resp[:])
-	default:
-		enc, err := radius.EncryptUserPassword(nil, []byte(s.cfg.Password), s.cfg.Secret, p.Authenticator)
-		if err != nil {
-			s.mu.Lock()
-			s.ids.Put(id)
-			s.metrics.Malformed++
-			s.mu.Unlock()
-			return
-		}
-		p.Add(radius.AttrUserPassword, enc)
+// sendAcct builds and sends one accounting record.
+func (s *shard) sendAcct(sess *session, e Exchange, status uint32, dueAt, now time.Time) {
+	if s.acct == nil {
+		return
 	}
 
-	if s.cfg.NASIdentifier != "" {
-		p.AddString(radius.AttrNASIdentifier, s.cfg.NASIdentifier)
+	s.mu.Lock()
+	id, ok := s.acct.ids.Get()
+	if !ok {
+		s.metrics[e].Blocked++
+		s.mu.Unlock()
+		return
 	}
-	p.AddUint32(radius.AttrServiceType, 2)    // Framed-User
-	p.AddUint32(radius.AttrFramedProtocol, 1) // PPP
+	s.mu.Unlock()
 
-	wire, err := s.enc.Encode(p)
+	p, err := radius.New(radius.CodeAccountingRequest, id)
 	if err != nil {
 		s.mu.Lock()
-		s.ids.Put(id)
-		s.metrics.Malformed++
+		s.acct.ids.Put(id)
+		s.metrics[e].Malformed++
+		s.mu.Unlock()
+		return
+	}
+	sess.buildAcct(p, s.cfg, status, now)
+
+	s.transmit(s.acct, p, sess, e, id, dueAt)
+}
+
+// abort releases an identifier for a request that could not be built.
+func (s *shard) abort(l *link, id uint8, sess *session, e Exchange) {
+	s.mu.Lock()
+	l.ids.Put(id)
+	s.metrics[e].Malformed++
+	delete(s.sessions, sess.index)
+	s.mu.Unlock()
+}
+
+// transmit encodes, records and sends one request.
+func (s *shard) transmit(l *link, p *radius.Packet, sess *session, e Exchange, id uint8, dueAt time.Time) {
+	s.mu.Lock()
+	wire, err := l.enc.Encode(p)
+	if err != nil {
+		l.ids.Put(id)
+		s.metrics[e].Malformed++
 		s.mu.Unlock()
 		return
 	}
@@ -300,31 +466,29 @@ func (s *shard) offer(seq uint64, dueAt time.Time) {
 	if dueAt.IsZero() {
 		dueAt = sentAt
 	}
-
-	s.mu.Lock()
-	s.pending[id] = pending{
-		active: true,
-		seq:    seq,
-		auth:   p.Authenticator,
-		dueAt:  dueAt,
-		sentAt: sentAt,
+	l.pending[id] = pending{
+		active:   true,
+		session:  sess.index,
+		exchange: e,
+		auth:     p.Authenticator,
+		dueAt:    dueAt,
+		sentAt:   sentAt,
 	}
-	s.metrics.Sent++
+	s.metrics[e].Sent++
+
+	// The encoder's buffer is reused on its next call, so the bytes must go
+	// out before the lock is released.
+	_, werr := l.conn.Write(wire)
+	if werr != nil {
+		l.pending[id].active = false
+		l.ids.Put(id)
+		s.metrics[e].Sent--
+		s.metrics[e].Malformed++
+	}
 	s.mu.Unlock()
-
-	if _, err := s.conn.Write(wire); err != nil {
-		s.mu.Lock()
-		if s.pending[id].active && s.pending[id].seq == seq {
-			s.pending[id].active = false
-			s.ids.Put(id)
-			s.metrics.Sent--
-			s.metrics.Malformed++
-		}
-		s.mu.Unlock()
-	}
 }
 
-func (s *shard) receive(ctx context.Context) {
+func (s *shard) receive(ctx context.Context, l *link) {
 	buf := make([]byte, radius.MaxPacketLen)
 	for {
 		if s.stopped.Load() || ctx.Err() != nil {
@@ -332,67 +496,100 @@ func (s *shard) receive(ctx context.Context) {
 		}
 		// A deadline keeps the read from parking forever once the run is
 		// over, without needing to close the socket from another goroutine.
-		_ = s.conn.SetReadDeadline(time.Now().Add(sweepInterval))
+		_ = l.conn.SetReadDeadline(time.Now().Add(sweepInterval))
 
-		n, err := s.conn.Read(buf)
+		n, err := l.conn.Read(buf)
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if isTimeout(err) {
 				continue
 			}
 			return
 		}
-		s.handle(buf[:n], time.Now())
+		s.handle(l, buf[:n], time.Now())
 	}
 }
 
 // handle matches a reply to its request and records the outcome.
-func (s *shard) handle(reply []byte, at time.Time) {
+func (s *shard) handle(l *link, reply []byte, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(reply) < radius.HeaderLen {
-		s.metrics.Malformed++
+		s.metrics[ExchangeAccess].Malformed++
 		return
 	}
 	id := reply[1]
-	p := &s.pending[id]
+	p := &l.pending[id]
 	if !p.active {
-		// A reply to something we already gave up on, or to nothing at all.
-		s.metrics.Unmatched++
+		// A reply to something already given up on, or to nothing at all.
+		s.metrics[ExchangeAccess].Unmatched++
 		return
 	}
+	m := s.metrics[p.exchange]
 
 	if err := radius.Verify(reply, p.auth, s.cfg.Secret); err != nil {
 		// Do not release the identifier here. A forged or mis-signed packet
 		// must not be able to cancel a request that is still legitimately
 		// outstanding, or an attacker could free identifiers at will.
-		s.metrics.Unverified++
+		m.Unverified++
 		return
 	}
 
 	decoded, err := radius.Decode(reply)
 	if err != nil {
-		s.metrics.Malformed++
+		m.Malformed++
 		return
 	}
 
+	sess := s.sessions[p.session]
+
 	switch decoded.Code {
 	case radius.CodeAccessAccept:
-		s.metrics.Accepted++
+		m.Accepted++
+		if sess != nil {
+			sess.applyAccept(decoded, s.cfg)
+			s.onAuthenticated(sess, at)
+		}
 	case radius.CodeAccessReject:
-		s.metrics.Rejected++
+		m.Rejected++
+		if sess != nil {
+			delete(s.sessions, sess.index)
+			sess.state = stateDone
+		}
 	case radius.CodeAccessChallenge:
-		s.metrics.Challenged++
+		m.Challenged++
+		if sess != nil {
+			delete(s.sessions, sess.index)
+			sess.state = stateDone
+		}
+	case radius.CodeAccountingResponse:
+		m.Accepted++
 	default:
-		s.metrics.Malformed++
+		m.Malformed++
 	}
 
-	s.metrics.Latency.Record(uint64(at.Sub(p.dueAt)))
-	s.metrics.ServiceTime.Record(uint64(at.Sub(p.sentAt)))
+	m.Latency.Record(uint64(at.Sub(p.dueAt)))
+	m.ServiceTime.Record(uint64(at.Sub(p.sentAt)))
 
 	p.active = false
-	s.ids.Put(id)
+	l.ids.Put(id)
+}
+
+// onAuthenticated moves a session from authenticating to online. The caller
+// holds the lock.
+func (s *shard) onAuthenticated(sess *session, at time.Time) {
+	if !s.cfg.accounting() {
+		// Without accounting a session is only an authentication, so it is
+		// finished as soon as it succeeds.
+		delete(s.sessions, sess.index)
+		sess.state = stateDone
+		s.sessionsStarted++
+		s.sessionsCompleted++
+		return
+	}
+	sess.state = stateAcctStart
+	sess.nextAt = at
+	heap.Push(&s.due, sess)
 }
 
 // expire releases requests that have gone unanswered past the timeout.
@@ -401,36 +598,27 @@ func (s *shard) expire(now time.Time) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.pending {
-		p := &s.pending[i]
-		if !p.active || now.Sub(p.sentAt) < timeout {
+	for _, l := range []*link{s.auth, s.acct} {
+		if l == nil {
 			continue
 		}
-		p.active = false
-		s.metrics.Timeouts++
-		s.ids.Put(uint8(i))
-	}
-}
+		for i := range l.pending {
+			p := &l.pending[i]
+			if !p.active || now.Sub(p.sentAt) < timeout {
+				continue
+			}
+			p.active = false
+			s.metrics[p.exchange].Timeouts++
+			l.ids.Put(uint8(i))
 
-// drain waits for outstanding requests to be answered or to time out.
-func (s *shard) drain(ctx context.Context) {
-	deadline := time.Now().Add(s.cfg.timeout())
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		outstanding := radius.IDSpace - s.ids.Available()
-		s.mu.Unlock()
-		if outstanding == 0 {
-			return
-		}
-
-		s.expire(time.Now())
-
-		select {
-		case <-ctx.Done():
-			// Cancellation stops the run, but the requests already sent are
-			// still accounted for by expireAll.
-			return
-		case <-time.After(sweepInterval):
+			// A session whose authentication was never answered cannot go
+			// online, so it is finished rather than left in the table.
+			if p.exchange == ExchangeAccess {
+				if sess := s.sessions[p.session]; sess != nil && sess.state == stateAuthenticating {
+					delete(s.sessions, sess.index)
+					sess.state = stateDone
+				}
+			}
 		}
 	}
 }
@@ -439,18 +627,31 @@ func (s *shard) drain(ctx context.Context) {
 func (s *shard) expireAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.pending {
-		if s.pending[i].active {
-			s.pending[i].active = false
-			s.metrics.Timeouts++
+	for _, l := range []*link{s.auth, s.acct} {
+		if l == nil {
+			continue
+		}
+		for i := range l.pending {
+			if l.pending[i].active {
+				l.pending[i].active = false
+				s.metrics[l.pending[i].exchange].Timeouts++
+			}
 		}
 	}
 }
 
-// expandUsername substitutes the request sequence number into a template.
-func expandUsername(tmpl string, seq uint64) string {
-	if !strings.Contains(tmpl, "{n}") {
-		return tmpl
-	}
-	return strings.ReplaceAll(tmpl, "{n}", strconv.FormatUint(seq, 10))
+// sessionQueue orders sessions by when their next lifecycle step falls due.
+type sessionQueue []*session
+
+func (q sessionQueue) Len() int           { return len(q) }
+func (q sessionQueue) Less(i, j int) bool { return q[i].nextAt.Before(q[j].nextAt) }
+func (q sessionQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q *sessionQueue) Push(x any)        { *q = append(*q, x.(*session)) }
+func (q *sessionQueue) Pop() any {
+	old := *q
+	n := len(old)
+	s := old[n-1]
+	old[n-1] = nil
+	*q = old[:n-1]
+	return s
 }

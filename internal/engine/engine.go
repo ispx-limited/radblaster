@@ -26,40 +26,61 @@ const (
 
 // Config describes a run.
 type Config struct {
-	// Server is the target, as host:port.
+	// Server is the authentication endpoint, as host:port.
 	Server string
+	// AcctServer is the accounting endpoint. Empty disables accounting, so a
+	// session is then just an authentication.
+	AcctServer string
 	// Secret is the shared secret.
 	Secret []byte
-	// Rate is the offered requests per second across the whole run. Zero
-	// means send as fast as the sockets allow.
+
+	// Rate is the offered session setup rate per second across the whole
+	// run. Zero sets sessions up as fast as the links allow.
 	Rate float64
-	// Count bounds the run by number of requests. Zero means unbounded.
+	// Count bounds the run by number of sessions. Zero means unbounded.
 	Count uint64
 	// Duration bounds the run by wall-clock time. Zero means unbounded.
 	Duration time.Duration
-	// Sockets is the number of source ports to spread across. Each carries
-	// its own identifier space, so this sets the ceiling on outstanding
-	// requests at 256 per socket. Zero picks a sensible default.
-	Sockets int
-	// Timeout is how long a request may go unanswered before it is counted
-	// as lost.
+
+	// Hold is how long a session stays online before it is torn down. Zero
+	// stops it as soon as accounting has started, which is the shape of a
+	// churn test rather than a soak.
+	Hold time.Duration
+	// InterimInterval is the fallback update period, used when the server
+	// does not state one in its Access-Accept.
+	InterimInterval time.Duration
+
+	// TrafficUp and TrafficDown are the octets per second each session
+	// claims to have carried, which drives the accounting counters.
+	TrafficUp   uint64
+	TrafficDown uint64
+
+	// Links is the number of source ports to spread across, per endpoint.
+	// Each carries its own identifier space, so this sets the ceiling on
+	// outstanding requests at 256 per link. Zero picks a default.
+	Links int
+	// Timeout is how long a request may go unanswered before it is lost.
 	Timeout time.Duration
-	// Auth selects PAP or CHAP.
-	Auth Auth
-	// Username is a template; {n} is replaced with the request sequence
-	// number, starting at 1.
+
+	Auth     Auth
 	Username string
-	// Password is the cleartext to authenticate with.
 	Password string
-	// NASIdentifier, when set, is sent as NAS-Identifier.
-	NASIdentifier string
+
+	// Attributes a real access node would set.
+	NASIdentifier    string
+	NASIPAddress     []byte
+	NASPortType      uint32
+	CallingStationID string
+	NASPortID        string
+	TerminateCause   uint32
+
 	// Seed makes a run reproducible. Zero draws a fresh seed.
 	Seed uint64
 }
 
-func (c *Config) sockets() int {
-	if c.Sockets > 0 {
-		return c.Sockets
+func (c *Config) links() int {
+	if c.Links > 0 {
+		return c.Links
 	}
 	n := runtime.NumCPU()
 	if n > 16 {
@@ -78,6 +99,15 @@ func (c *Config) timeout() time.Duration {
 	return c.Timeout
 }
 
+func (c *Config) accounting() bool { return c.AcctServer != "" }
+
+func (c *Config) terminateCause() uint32 {
+	if c.TerminateCause > 0 {
+		return c.TerminateCause
+	}
+	return 1 // User-Request
+}
+
 func (c *Config) validate() error {
 	switch {
 	case c.Server == "":
@@ -87,9 +117,11 @@ func (c *Config) validate() error {
 	case c.Username == "":
 		return errors.New("engine: no username given")
 	case c.Count == 0 && c.Duration == 0:
-		return errors.New("engine: a run needs either a request count or a duration")
+		return errors.New("engine: a run needs either a session count or a duration")
 	case c.Auth != AuthPAP && c.Auth != AuthCHAP:
 		return fmt.Errorf("engine: unknown authentication method %q", c.Auth)
+	case c.accounting() && c.InterimInterval < 0:
+		return errors.New("engine: interim interval cannot be negative")
 	}
 	return nil
 }
@@ -115,12 +147,12 @@ type Metrics struct {
 	Unmatched  uint64
 
 	// Blocked counts requests that could not be offered because every
-	// identifier on the chosen socket was already outstanding. A non-zero
-	// value means the run was limited by our own concurrency rather than by
-	// the server, and the result understates what the server could take.
+	// identifier on the chosen link was already outstanding. A non-zero value
+	// means the run was limited by its own concurrency rather than by the
+	// server, and the result understates what the server could take.
 	Blocked uint64
 
-	// Latency is measured from the moment a request was *due* to be sent
+	// Latency is measured from the moment a request was due to be sent
 	// rather than from when it actually went out. Under overload those
 	// diverge, and measuring from the actual send time quietly hides the
 	// queueing delay that a stress test exists to find.
@@ -161,20 +193,40 @@ func (m *Metrics) Answered() uint64 {
 
 // Result is the outcome of a whole run.
 type Result struct {
-	Access  *Metrics
+	// Exchanges holds one entry per kind of request, indexed by Exchange.
+	Exchanges [exchangeCount]*Metrics
+
 	Elapsed time.Duration
 
-	// Sockets is how many source ports the run used. With 256 identifiers
-	// each, this sets the hard ceiling on requests in flight, and therefore
-	// on throughput for a given server response time.
-	Sockets int
+	// Links is how many source ports were used per endpoint. With 256
+	// identifiers each, this sets the hard ceiling on requests in flight and
+	// therefore on throughput for a given server response time.
+	Links int
 
-	// OfferedRate is the rate the run was asked to sustain, and AchievedRate
-	// what it managed. A gap between them means the run could not keep to its
-	// own schedule, so the latency figures should be read as the server being
-	// measured under less load than intended.
+	// SessionsStarted counts sessions that reached the online state, and
+	// SessionsCompleted those that were also torn down cleanly.
+	SessionsStarted   uint64
+	SessionsCompleted uint64
+
+	// OfferedRate is the session setup rate the run was asked to sustain,
+	// and AchievedRate what it managed over SetupWindow, the period during
+	// which sessions were actually being established.
 	OfferedRate  float64
 	AchievedRate float64
+	SetupWindow  time.Duration
+}
+
+// Access returns the authentication metrics, which every run produces.
+func (r *Result) Access() *Metrics { return r.Exchanges[ExchangeAccess] }
+
+// Accounting reports whether any accounting exchange was attempted.
+func (r *Result) Accounting() bool {
+	for e := ExchangeAcctStart; e < exchangeCount; e++ {
+		if r.Exchanges[e].Sent > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Run drives the configured load and returns once the run is complete or ctx
@@ -188,14 +240,15 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	if seed == 0 {
 		seed = rand.Uint64()
 	}
+	runID := uint32(seed)
 
-	n := cfg.sockets()
+	n := cfg.links()
 	shards := make([]*shard, 0, n)
 	for i := 0; i < n; i++ {
 		// Each shard derives its own stream from the run seed, so the run is
 		// reproducible without the shards having to coordinate.
 		r := rand.New(rand.NewPCG(seed, uint64(i)))
-		s, err := newShard(&cfg, i, n, r)
+		s, err := newShard(&cfg, i, n, runID, r)
 		if err != nil {
 			for _, done := range shards {
 				done.close()
@@ -218,12 +271,9 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		defer stop()
 	}
 
-	// Sequence numbers are handed out globally so every request gets a
-	// distinct subscriber, whichever socket carries it.
-	seq := &counter{}
-	if cfg.Count > 0 {
-		seq.limit = cfg.Count
-	}
+	// Session numbers are handed out globally so every session gets a
+	// distinct subscriber, whichever link carries it.
+	seq := &counter{limit: cfg.Count}
 
 	started := time.Now()
 
@@ -239,26 +289,42 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 
 	elapsed := time.Since(started)
 
-	total := newMetrics("Access-Request")
+	res := &Result{
+		Elapsed:     elapsed,
+		Links:       n,
+		OfferedRate: cfg.Rate,
+	}
+	for e := range res.Exchanges {
+		res.Exchanges[e] = newMetrics(Exchange(e).String())
+	}
+	var setupEnd time.Time
 	for _, s := range shards {
 		s.mu.Lock()
-		total.merge(s.metrics)
+		for e := range res.Exchanges {
+			res.Exchanges[e].merge(s.metrics[e])
+		}
+		res.SessionsStarted += s.sessionsStarted
+		res.SessionsCompleted += s.sessionsCompleted
+		if s.lastSetupAt.After(setupEnd) {
+			setupEnd = s.lastSetupAt
+		}
 		s.mu.Unlock()
 	}
 
-	res := &Result{
-		Access:      total,
-		Elapsed:     elapsed,
-		Sockets:     n,
-		OfferedRate: cfg.Rate,
-	}
-	if elapsed > 0 {
-		res.AchievedRate = float64(total.Sent) / elapsed.Seconds()
+	// Measure the setup rate over the window sessions were actually being
+	// established in. Dividing by the whole run would understate it whenever
+	// sessions are held online afterwards, because most of that time is spent
+	// deliberately not setting anything up.
+	res.SetupWindow = setupEnd.Sub(started)
+	if res.SetupWindow > 0 {
+		res.AchievedRate = float64(res.Access().Sent) / res.SetupWindow.Seconds()
+	} else if elapsed > 0 {
+		res.AchievedRate = float64(res.Access().Sent) / elapsed.Seconds()
 	}
 	return res, nil
 }
 
-// counter hands out request sequence numbers across shards.
+// counter hands out session sequence numbers across shards.
 type counter struct {
 	mu    sync.Mutex
 	next  uint64
@@ -275,4 +341,11 @@ func (c *counter) take() (uint64, bool) {
 	}
 	c.next++
 	return c.next, true
+}
+
+// remaining reports whether any sequence numbers are left.
+func (c *counter) remaining() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.limit == 0 || c.next < c.limit
 }

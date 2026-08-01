@@ -116,7 +116,7 @@ func baseConfig(addr string) Config {
 		Username: "subscriber{n}@example.net",
 		Password: "DingDong",
 		Auth:     AuthPAP,
-		Sockets:  2,
+		Links:    2,
 		Timeout:  2 * time.Second,
 		Seed:     1,
 	}
@@ -133,15 +133,15 @@ func TestRunAcceptsEveryRequest(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if res.Access.Sent != 200 {
-		t.Errorf("Sent = %d, want 200", res.Access.Sent)
+	if res.Access().Sent != 200 {
+		t.Errorf("Sent = %d, want 200", res.Access().Sent)
 	}
-	if res.Access.Accepted != 200 {
+	if res.Access().Accepted != 200 {
 		t.Errorf("Accepted = %d, want 200 (timeouts %d, unverified %d, unmatched %d)",
-			res.Access.Accepted, res.Access.Timeouts, res.Access.Unverified, res.Access.Unmatched)
+			res.Access().Accepted, res.Access().Timeouts, res.Access().Unverified, res.Access().Unmatched)
 	}
-	if res.Access.Latency.Count() != 200 {
-		t.Errorf("recorded %d latencies, want 200", res.Access.Latency.Count())
+	if res.Access().Latency.Count() != 200 {
+		t.Errorf("recorded %d latencies, want 200", res.Access().Latency.Count())
 	}
 }
 
@@ -156,16 +156,16 @@ func TestRunCountsRejectsSeparatelyFromFailures(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if res.Access.Rejected != 50 {
-		t.Errorf("Rejected = %d, want 50", res.Access.Rejected)
+	if res.Access().Rejected != 50 {
+		t.Errorf("Rejected = %d, want 50", res.Access().Rejected)
 	}
-	if res.Access.Accepted != 0 {
-		t.Errorf("Accepted = %d, want 0", res.Access.Accepted)
+	if res.Access().Accepted != 0 {
+		t.Errorf("Accepted = %d, want 0", res.Access().Accepted)
 	}
 	// A rejection is a healthy server saying no, not a transport failure.
-	if res.Access.Timeouts != 0 || res.Access.Unverified != 0 {
+	if res.Access().Timeouts != 0 || res.Access().Unverified != 0 {
 		t.Errorf("a policy rejection was recorded as a failure: timeouts %d, unverified %d",
-			res.Access.Timeouts, res.Access.Unverified)
+			res.Access().Timeouts, res.Access().Unverified)
 	}
 }
 
@@ -182,14 +182,14 @@ func TestRunCountsTimeouts(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if res.Access.Sent != 20 {
-		t.Errorf("Sent = %d, want 20", res.Access.Sent)
+	if res.Access().Sent != 20 {
+		t.Errorf("Sent = %d, want 20", res.Access().Sent)
 	}
-	if res.Access.Timeouts != 20 {
-		t.Errorf("Timeouts = %d, want 20", res.Access.Timeouts)
+	if res.Access().Timeouts != 20 {
+		t.Errorf("Timeouts = %d, want 20", res.Access().Timeouts)
 	}
-	if res.Access.Answered() != 0 {
-		t.Errorf("Answered = %d, want 0", res.Access.Answered())
+	if res.Access().Answered() != 0 {
+		t.Errorf("Answered = %d, want 0", res.Access().Answered())
 	}
 }
 
@@ -207,12 +207,12 @@ func TestRunReportsSecretMismatchDistinctly(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if res.Access.Unverified == 0 {
+	if res.Access().Unverified == 0 {
 		t.Error("Unverified = 0, want the mis-signed replies to be counted")
 	}
-	if res.Access.Accepted != 0 {
+	if res.Access().Accepted != 0 {
 		t.Errorf("Accepted = %d, want 0; a reply that fails verification must never count as success",
-			res.Access.Accepted)
+			res.Access().Accepted)
 	}
 }
 
@@ -222,7 +222,7 @@ func TestRunHonoursRate(t *testing.T) {
 	cfg := baseConfig(srv.addr())
 	cfg.Rate = 500
 	cfg.Duration = 600 * time.Millisecond
-	cfg.Sockets = 2
+	cfg.Links = 2
 
 	res, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -231,8 +231,8 @@ func TestRunHonoursRate(t *testing.T) {
 
 	// Allow generous slack: this asserts pacing happens at all, not that the
 	// scheduler is precise, so it stays reliable on a loaded machine.
-	if res.Access.Sent < 150 || res.Access.Sent > 500 {
-		t.Errorf("Sent = %d over 600ms at 500/s, want roughly 300", res.Access.Sent)
+	if res.Access().Sent < 150 || res.Access().Sent > 500 {
+		t.Errorf("Sent = %d over 600ms at 500/s, want roughly 300", res.Access().Sent)
 	}
 	if res.AchievedRate <= 0 {
 		t.Error("AchievedRate was not computed")
@@ -289,7 +289,7 @@ func TestLatencyIncludesSchedulingDelay(t *testing.T) {
 	cfg := baseConfig(srv.addr())
 	// One socket and a rate far beyond what 256 outstanding requests at 40ms
 	// each can sustain, so the schedule slips.
-	cfg.Sockets = 1
+	cfg.Links = 1
 	cfg.Rate = 20000
 	cfg.Duration = 500 * time.Millisecond
 	cfg.Timeout = 2 * time.Second
@@ -298,17 +298,17 @@ func TestLatencyIncludesSchedulingDelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Access.Latency.Count() == 0 {
+	if res.Access().Latency.Count() == 0 {
 		t.Skip("no replies were recorded, nothing to compare")
 	}
 
-	latency := res.Access.Latency.Quantile(0.5)
-	service := res.Access.ServiceTime.Quantile(0.5)
+	latency := res.Access().Latency.Quantile(0.5)
+	service := res.Access().ServiceTime.Quantile(0.5)
 	if latency < service {
 		t.Errorf("median latency %v is below median service time %v; scheduling delay was lost",
 			time.Duration(latency), time.Duration(service))
 	}
-	if res.Access.Blocked == 0 {
+	if res.Access().Blocked == 0 {
 		t.Log("note: identifier space was not exhausted, so the schedule may not have slipped")
 	}
 }
@@ -320,7 +320,7 @@ func TestBlockedCountedWhenIdentifiersExhausted(t *testing.T) {
 	srv.silent.Store(true)
 
 	cfg := baseConfig(srv.addr())
-	cfg.Sockets = 1
+	cfg.Links = 1
 	cfg.Rate = 0 // unpaced: offer as fast as possible
 	cfg.Duration = 300 * time.Millisecond
 	cfg.Timeout = 10 * time.Second // long enough that nothing is released
@@ -330,11 +330,11 @@ func TestBlockedCountedWhenIdentifiersExhausted(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if res.Access.Sent > radius.IDSpace {
+	if res.Access().Sent > radius.IDSpace {
 		t.Errorf("Sent = %d with one socket and no replies, want at most %d outstanding",
-			res.Access.Sent, radius.IDSpace)
+			res.Access().Sent, radius.IDSpace)
 	}
-	if res.Access.Blocked == 0 {
+	if res.Access().Blocked == 0 {
 		t.Error("Blocked = 0, want the exhausted identifier space to be visible")
 	}
 }
@@ -396,7 +396,7 @@ func TestRunUsesCHAP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Access.Accepted != 25 {
-		t.Errorf("Accepted = %d, want 25", res.Access.Accepted)
+	if res.Access().Accepted != 25 {
+		t.Errorf("Accepted = %d, want 25", res.Access().Accepted)
 	}
 }
