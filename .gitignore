@@ -1,0 +1,13 @@
+bin/
+dist/
+coverage.out
+coverage.html
+
+# Local environment
+.env
+*.local
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store

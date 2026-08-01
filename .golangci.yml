@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - revive
+    - unconvert
+    - usetesting
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+
+  exclusions:
+    rules:
+      # MD5 is not a choice here; the protocol specifies it.
+      - path: internal/radius/
+        text: "weak cryptographic primitive"
+
+formatters:
+  enable:
+    - gofmt
