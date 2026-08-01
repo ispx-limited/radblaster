@@ -538,3 +538,195 @@ func TestLatencyMeasuredFromTheOriginalSend(t *testing.T) {
 			time.Duration(got))
 	}
 }
+
+// TestShapeRampClimbs checks that a ramp offers less early than late, which is
+// what makes the knee findable: the point where latency turns up is capacity.
+func TestShapeRampClimbs(t *testing.T) {
+	cfg := Config{Rate: 1000, Duration: 10 * time.Second, Shape: ShapeRamp}
+
+	early := cfg.rateAt(1 * time.Second)
+	mid := cfg.rateAt(5 * time.Second)
+	late := cfg.rateAt(9 * time.Second)
+
+	if !(early < mid && mid < late) {
+		t.Errorf("ramp did not climb: %.0f then %.0f then %.0f", early, mid, late)
+	}
+	if late > cfg.Rate {
+		t.Errorf("ramp reached %.0f, above the configured %.0f", late, cfg.Rate)
+	}
+	if got := cfg.rateAt(20 * time.Second); got != cfg.Rate {
+		t.Errorf("past the end the ramp gave %.0f, want it held at %.0f", got, cfg.Rate)
+	}
+}
+
+func TestShapeBurstAlternates(t *testing.T) {
+	cfg := Config{Rate: 1000, Shape: ShapeBurst, BurstPeriod: 10 * time.Second, BurstLow: 0.1}
+
+	if got := cfg.rateAt(1 * time.Second); got != 1000 {
+		t.Errorf("first half of the cycle gave %.0f, want the full rate", got)
+	}
+	if got := cfg.rateAt(7 * time.Second); got != 100 {
+		t.Errorf("second half gave %.0f, want a tenth of the rate", got)
+	}
+	if got := cfg.rateAt(11 * time.Second); got != 1000 {
+		t.Errorf("the cycle did not repeat: %.0f", got)
+	}
+}
+
+func TestShapeStampedeIsUnpaced(t *testing.T) {
+	cfg := Config{Rate: 1000, Shape: ShapeStampede}
+	if got := cfg.rateAt(0); got != 0 {
+		t.Errorf("stampede gave %.0f, want it unpaced so everything is offered at once", got)
+	}
+}
+
+func TestShapeSteadyHolds(t *testing.T) {
+	cfg := Config{Rate: 500}
+	for _, at := range []time.Duration{0, time.Second, time.Minute} {
+		if got := cfg.rateAt(at); got != 500 {
+			t.Errorf("steady rate at %s = %.0f, want 500", at, got)
+		}
+	}
+}
+
+func TestBurstRunOffersLessThanSteady(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+
+	base := baseConfig(srv.addr())
+	base.Rate = 400
+	base.Duration = 800 * time.Millisecond
+	base.Timeout = time.Second
+
+	steady := base
+	steady.Shape = ShapeSteady
+	a, err := Run(context.Background(), steady)
+	if err != nil {
+		t.Fatalf("steady run: %v", err)
+	}
+
+	burst := base
+	burst.Shape = ShapeBurst
+	burst.BurstPeriod = 400 * time.Millisecond
+	burst.BurstLow = 0
+	b, err := Run(context.Background(), burst)
+	if err != nil {
+		t.Fatalf("burst run: %v", err)
+	}
+
+	// Half of each cycle offers nothing, so the burst run should send
+	// materially fewer requests over the same wall clock.
+	if b.Access().Sent >= a.Access().Sent {
+		t.Errorf("burst sent %d against steady's %d, want fewer",
+			b.Access().Sent, a.Access().Sent)
+	}
+}
+
+func TestConfigRejectsBadShapeSettings(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+
+	tests := []struct {
+		name   string
+		mangle func(*Config)
+	}{
+		{"ramp with no duration", func(c *Config) { c.Shape = ShapeRamp; c.Duration = 0; c.Count = 10 }},
+		{"reject rate above one", func(c *Config) { c.RejectRate = 1.5 }},
+		{"reject rate below zero", func(c *Config) { c.RejectRate = -0.1 }},
+		{"upstream max below min", func(c *Config) { c.TrafficUp = 100; c.TrafficUpMax = 50 }},
+		{"downstream max below min", func(c *Config) { c.TrafficDown = 100; c.TrafficDownMax = 50 }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig(srv.addr())
+			cfg.Count = 1
+			tc.mangle(&cfg)
+			if _, err := Run(context.Background(), cfg); err == nil {
+				t.Error("expected the run to be refused")
+			}
+		})
+	}
+}
+
+// TestRampIsStillPaced guards a trap in deciding whether a run is paced: a
+// ramp starts at a rate of zero, so asking for the rate at the start reads as
+// unpaced and would leave the whole run offering as fast as it can.
+func TestRampIsStillPaced(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+
+	cfg := baseConfig(srv.addr())
+	cfg.Rate = 200
+	cfg.Duration = time.Second
+	cfg.Shape = ShapeRamp
+	cfg.Links = 4
+	cfg.Timeout = time.Second
+
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// A ramp to 200/s over a second averages about half that, so roughly a
+	// hundred requests. An unpaced run would send tens of thousands.
+	if got := res.Access().Sent; got > 400 {
+		t.Errorf("Sent = %d over a 1s ramp to 200/s, want roughly 100; the run was not paced", got)
+	}
+	if res.Access().Sent == 0 {
+		t.Error("the ramp sent nothing at all")
+	}
+}
+
+// TestSessionsByMatchesTheRate checks the cumulative demand the pacer works
+// from, which is the integral of the offered rate.
+func TestSessionsByMatchesTheRate(t *testing.T) {
+	t.Run("steady", func(t *testing.T) {
+		cfg := Config{Rate: 100}
+		if got := cfg.sessionsBy(10 * time.Second); got != 1000 {
+			t.Errorf("= %.0f, want 1000", got)
+		}
+	})
+
+	t.Run("ramp", func(t *testing.T) {
+		cfg := Config{Rate: 100, Duration: 10 * time.Second, Shape: ShapeRamp}
+		// The area under a climb to the full rate is half the rectangle.
+		if got := cfg.sessionsBy(10 * time.Second); got != 500 {
+			t.Errorf("across the ramp = %.0f, want 500", got)
+		}
+		// A quarter of the way in, demand is a sixteenth of the total.
+		if got := cfg.sessionsBy(2500 * time.Millisecond); got != 31.25 {
+			t.Errorf("a quarter in = %.2f, want 31.25", got)
+		}
+		// Past the end it carries on at the full rate.
+		if got := cfg.sessionsBy(11 * time.Second); got != 600 {
+			t.Errorf("past the end = %.0f, want 600", got)
+		}
+	})
+
+	t.Run("burst", func(t *testing.T) {
+		cfg := Config{Rate: 100, Shape: ShapeBurst, BurstPeriod: 10 * time.Second, BurstLow: 0}
+		// Half of each cycle offers nothing.
+		if got := cfg.sessionsBy(10 * time.Second); got != 500 {
+			t.Errorf("one cycle = %.0f, want 500", got)
+		}
+		if got := cfg.sessionsBy(20 * time.Second); got != 1000 {
+			t.Errorf("two cycles = %.0f, want 1000", got)
+		}
+	})
+}
+
+// TestTimeForInvertsDemand is what gives each session the moment it was due,
+// which is what latency is measured against.
+func TestTimeForInvertsDemand(t *testing.T) {
+	for _, cfg := range []Config{
+		{Rate: 100},
+		{Rate: 100, Duration: 10 * time.Second, Shape: ShapeRamp},
+		{Rate: 100, Shape: ShapeBurst, BurstPeriod: 4 * time.Second, BurstLow: 0.2},
+	} {
+		for _, n := range []float64{1, 17, 250} {
+			at := cfg.timeFor(n)
+			got := cfg.sessionsBy(at)
+			if got < n-0.01 || got > n+1 {
+				t.Errorf("%s: timeFor(%.0f) = %s, where demand is %.2f", cfg.shape(), n, at, got)
+			}
+		}
+	}
+}

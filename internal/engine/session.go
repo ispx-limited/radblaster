@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +83,14 @@ type session struct {
 	onlineAt time.Time
 	stopAt   time.Time
 
+	// up and down are this subscriber's own octets per second, drawn once so
+	// its counters climb at a consistent rate for its whole life.
+	up   uint64
+	down uint64
+
+	// reject marks a session deliberately given an unknown username.
+	reject bool
+
 	// online mirrors membership of the shard's online tally. Keeping it as a
 	// flag rather than deriving it from state means the count stays right
 	// however a session leaves, including a teardown that passes through an
@@ -90,8 +99,11 @@ type session struct {
 }
 
 // newSession prepares a subscriber that has not yet authenticated.
-func newSession(index uint32, seq uint64, cfg *Config, runID uint32) *session {
-	return &session{
+//
+// Everything that varies between subscribers is drawn here, from the shard's
+// seeded stream, so a run with the same seed produces the same estate.
+func newSession(index uint32, seq uint64, cfg *Config, runID uint32, rng *rand.Rand) *session {
+	s := &session{
 		index:    index,
 		seq:      seq,
 		state:    stateNew,
@@ -101,7 +113,33 @@ func newSession(index uint32, seq uint64, cfg *Config, runID uint32) *session {
 		// what a server keys its session table on.
 		acctSessionID: fmt.Sprintf("%08X-%08X", runID, seq),
 		interim:       cfg.InterimInterval,
+		up:            drawRate(cfg.TrafficUp, cfg.TrafficUpMax, rng),
+		down:          drawRate(cfg.TrafficDown, cfg.TrafficDownMax, rng),
 	}
+	if cfg.RejectRate > 0 && rng.Float64() < cfg.RejectRate {
+		s.reject = true
+		s.username = rejectUsername(cfg, seq)
+	}
+	return s
+}
+
+// drawRate picks a subscriber's traffic rate, uniformly across the range when
+// one is given and fixed otherwise.
+func drawRate(min, max uint64, rng *rand.Rand) uint64 {
+	if max <= min {
+		return min
+	}
+	return min + rng.Uint64N(max-min+1)
+}
+
+// rejectUsername returns a name no server should know. The prefix is
+// deliberate and obvious so a rejection in a server log reads as this tool
+// asking for one rather than as a real subscriber failing to get online.
+func rejectUsername(cfg *Config, seq uint64) string {
+	if cfg.RejectUsername != "" {
+		return expandUsername(cfg.RejectUsername, seq)
+	}
+	return "radblaster-unknown-" + strconv.FormatUint(seq, 10) + "@invalid"
 }
 
 // expandUsername substitutes the session number into a template.
@@ -124,6 +162,10 @@ func (s *session) buildAccess(p *radius.Packet, cfg *Config, rng interface{ Uint
 		resp := radius.CHAPPassword(ident, []byte(cfg.Password), p.Authenticator[:])
 		p.Add(radius.AttrCHAPPassword, resp[:])
 	default:
+		// PAP and IPoE put the same attribute on the wire. They differ in
+		// what it means: for PPPoE it is the subscriber's password, and for
+		// IPoE it is a fixed service password the access node was configured
+		// with, present only because an Access-Request has to carry one.
 		enc, err := radius.EncryptUserPassword(nil, []byte(cfg.Password), cfg.Secret, p.Authenticator)
 		if err != nil {
 			return err
@@ -163,7 +205,7 @@ func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now ti
 	}
 	p.AddUint32(radius.AttrAcctSessionTime, uint32(elapsed.Seconds()))
 
-	in, out := s.octets(cfg, elapsed)
+	in, out := s.octets(elapsed)
 	// Octet counters are 32 bits wide, so anything past four gibibytes is
 	// carried in the matching Gigawords attribute. Plenty of accounting
 	// pipelines mishandle that rollover, which is exactly why a load tool
@@ -188,11 +230,9 @@ func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now ti
 }
 
 // octets returns the traffic this session should have accumulated.
-func (s *session) octets(cfg *Config, elapsed time.Duration) (in, out uint64) {
+func (s *session) octets(elapsed time.Duration) (in, out uint64) {
 	secs := elapsed.Seconds()
-	in = cfg.TrafficUp + uint64(secs*float64(cfg.TrafficUp))
-	out = cfg.TrafficDown + uint64(secs*float64(cfg.TrafficDown))
-	return in, out
+	return s.up + uint64(secs*float64(s.up)), s.down + uint64(secs*float64(s.down))
 }
 
 // addCommon adds the attributes a BNG would put on every packet for a

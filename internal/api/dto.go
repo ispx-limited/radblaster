@@ -44,8 +44,17 @@ type RunConfig struct {
 	Hold     string  `json:"hold,omitempty"`
 	Interim  string  `json:"interim,omitempty"`
 
-	TrafficUp   uint64 `json:"trafficUp,omitempty"`
-	TrafficDown uint64 `json:"trafficDown,omitempty"`
+	TrafficUp      uint64 `json:"trafficUp,omitempty"`
+	TrafficUpMax   uint64 `json:"trafficUpMax,omitempty"`
+	TrafficDown    uint64 `json:"trafficDown,omitempty"`
+	TrafficDownMax uint64 `json:"trafficDownMax,omitempty"`
+
+	RejectRate     float64 `json:"rejectRate,omitempty"`
+	RejectUsername string  `json:"rejectUsername,omitempty"`
+
+	Shape       string  `json:"shape,omitempty"`
+	BurstPeriod string  `json:"burstPeriod,omitempty"`
+	BurstLow    float64 `json:"burstLow,omitempty"`
 
 	Links   int    `json:"links,omitempty"`
 	Timeout string `json:"timeout,omitempty"`
@@ -95,7 +104,12 @@ func (c RunConfig) toEngine(dict *radius.Dictionary) (engine.Config, error) {
 	cfg.Links = c.Links
 	cfg.Retries = c.Retries
 	cfg.TrafficUp = c.TrafficUp
+	cfg.TrafficUpMax = c.TrafficUpMax
 	cfg.TrafficDown = c.TrafficDown
+	cfg.TrafficDownMax = c.TrafficDownMax
+	cfg.RejectRate = c.RejectRate
+	cfg.RejectUsername = c.RejectUsername
+	cfg.BurstLow = c.BurstLow
 	cfg.NASIdentifier = c.NASIdentifier
 	cfg.NASPortType = c.NASPortType
 	cfg.CallingStationID = c.CallingStationID
@@ -114,8 +128,23 @@ func (c RunConfig) toEngine(dict *radius.Dictionary) (engine.Config, error) {
 		cfg.Auth = engine.AuthPAP
 	case "chap":
 		cfg.Auth = engine.AuthCHAP
+	case "ipoe":
+		cfg.Auth = engine.AuthIPoE
 	default:
-		return cfg, fmt.Errorf("unknown authentication method %q", c.Auth)
+		return cfg, fmt.Errorf("unknown access method %q", c.Auth)
+	}
+
+	switch strings.ToLower(c.Shape) {
+	case "", "steady":
+		cfg.Shape = engine.ShapeSteady
+	case "ramp":
+		cfg.Shape = engine.ShapeRamp
+	case "burst":
+		cfg.Shape = engine.ShapeBurst
+	case "stampede":
+		cfg.Shape = engine.ShapeStampede
+	default:
+		return cfg, fmt.Errorf("unknown load shape %q", c.Shape)
 	}
 
 	var err error
@@ -129,6 +158,9 @@ func (c RunConfig) toEngine(dict *radius.Dictionary) (engine.Config, error) {
 		return cfg, err
 	}
 	if cfg.Timeout, err = parseDuration("timeout", c.Timeout); err != nil {
+		return cfg, err
+	}
+	if cfg.BurstPeriod, err = parseDuration("burst period", c.BurstPeriod); err != nil {
 		return cfg, err
 	}
 
@@ -250,6 +282,20 @@ func dynAuthOf(d engine.DynAuth) DynAuth {
 	}
 }
 
+// Sample is one point on the live charts.
+//
+// The series is kept here rather than accumulated in the browser so that a
+// reload, or a browser that joins partway through, still sees the whole run
+// instead of starting from a blank chart.
+type Sample struct {
+	T        int64   `json:"t"`
+	Offered  float64 `json:"offered"`
+	Answered float64 `json:"answered"`
+	Lost     float64 `json:"lost"`
+	P95      uint64  `json:"p95"`
+	Service  uint64  `json:"service"`
+}
+
 // Status is the whole of what the interface renders.
 type Status struct {
 	State     State     `json:"state"`
@@ -274,6 +320,9 @@ type Status struct {
 	AchievedRate float64 `json:"achievedRate"`
 
 	Links int `json:"links"`
+
+	// History is the run's series so far, oldest first.
+	History []Sample `json:"history,omitempty"`
 
 	// Notes are the plain-language warnings that say why a result means less
 	// than it appears to. Composing them here rather than in the browser keeps

@@ -4,6 +4,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,12 +27,39 @@ type extraAttr struct {
 // Auth selects how a subscriber proves its identity.
 type Auth string
 
-// Supported authentication methods. Broadband access uses these two; a server
-// that stores hashed passwords can only support PAP, because CHAP requires the
-// server to hold the cleartext.
+// Supported authentication methods.
+//
+// PPPoE subscribers authenticate with PAP or CHAP; a server that stores hashed
+// passwords can only support PAP, because CHAP requires the cleartext.
+//
+// IPoE subscribers do not authenticate at all. The access node has no
+// credential to present, so it sends a fixed string in User-Password purely to
+// satisfy the requirement that an Access-Request carry one, and the server
+// identifies the subscriber from the line instead. The value is a service
+// password configured on the node, the same for every subscriber, and treating
+// it as a per-subscriber credential would misrepresent what is on the wire.
 const (
 	AuthPAP  Auth = "pap"
 	AuthCHAP Auth = "chap"
+	AuthIPoE Auth = "ipoe"
+)
+
+// Shape is how offered load varies over a run.
+type Shape string
+
+// Load shapes.
+const (
+	// ShapeSteady holds the rate flat.
+	ShapeSteady Shape = "steady"
+	// ShapeRamp climbs from nothing to the rate across the run, which is how
+	// the knee is found: the point where latency turns up is the capacity.
+	ShapeRamp Shape = "ramp"
+	// ShapeBurst alternates between the rate and a fraction of it, which is
+	// what catches a server that copes with load but not with change.
+	ShapeBurst Shape = "burst"
+	// ShapeStampede offers everything at once, the shape of a reload where
+	// every subscriber on a node re-authenticates together.
+	ShapeStampede Shape = "stampede"
 )
 
 // Config describes a run.
@@ -60,10 +88,31 @@ type Config struct {
 	// does not state one in its Access-Accept.
 	InterimInterval time.Duration
 
-	// TrafficUp and TrafficDown are the octets per second each session
-	// claims to have carried, which drives the accounting counters.
-	TrafficUp   uint64
-	TrafficDown uint64
+	// TrafficUp and TrafficDown are the octets per second a session claims to
+	// have carried, which drives the accounting counters. When the matching
+	// Max is higher, each session draws its own rate from that range, so an
+	// estate looks like a spread of subscribers rather than one repeated.
+	TrafficUp      uint64
+	TrafficUpMax   uint64
+	TrafficDown    uint64
+	TrafficDownMax uint64
+
+	// RejectRate is the fraction of sessions, from 0 to 1, given a username
+	// the server will not know. Rejection is often a different and slower
+	// path than acceptance, so a platform that is fine until a line card
+	// flaps and thousands of stale credentials arrive at once will only show
+	// that under a load that contains some.
+	RejectRate float64
+	// RejectUsername is the template for those sessions. Empty prefixes the
+	// normal username with something no realm will match.
+	RejectUsername string
+
+	// Shape is how the offered rate varies over the run.
+	Shape Shape
+	// BurstPeriod is one full cycle of ShapeBurst, and BurstLow the fraction
+	// of the rate offered during the quiet half.
+	BurstPeriod time.Duration
+	BurstLow    float64
 
 	// Links is the number of source ports to spread across, per endpoint.
 	// Each carries its own identifier space, so this sets the ceiling on
@@ -157,6 +206,146 @@ func (c *Config) retryDelay(attempts int) time.Duration {
 
 func (c *Config) accounting() bool { return c.AcctServer != "" }
 
+func (c *Config) shape() Shape {
+	if c.Shape == "" {
+		return ShapeSteady
+	}
+	return c.Shape
+}
+
+func (c *Config) burstPeriod() time.Duration {
+	if c.BurstPeriod <= 0 {
+		return 10 * time.Second
+	}
+	return c.BurstPeriod
+}
+
+// rateAt is the offered setup rate at a point in the run.
+//
+// The pacer integrates this forward rather than assuming a fixed gap between
+// sessions, which is what lets the rate vary without losing the schedule a
+// request was due on. Latency is still measured against that schedule, so a
+// burst the generator cannot keep up with shows as delay rather than
+// disappearing.
+// sessionsBy is how many sessions the whole run should have started by a point
+// in it, being the integral of the offered rate.
+//
+// The pacer works from this cumulative demand rather than from a gap between
+// sessions. A gap is the reciprocal of the rate, so a shape that starts near
+// zero produces an enormous first gap and then never re-examines it, which
+// leaves a ramp firing a handful of requests and stopping. Demand has no such
+// singularity, and inverting it gives the moment each session was due, which
+// is what latency is measured against.
+func (c *Config) sessionsBy(elapsed time.Duration) float64 {
+	if c.Rate <= 0 || elapsed <= 0 {
+		return 0
+	}
+	t := elapsed.Seconds()
+
+	switch c.shape() {
+	case ShapeRamp:
+		d := c.Duration.Seconds()
+		if d <= 0 {
+			return c.Rate * t
+		}
+		if t >= d {
+			// The area under the climb, then the full rate afterwards.
+			return c.Rate*d/2 + c.Rate*(t-d)
+		}
+		return c.Rate * t * t / (2 * d)
+
+	case ShapeBurst:
+		period := c.burstPeriod().Seconds()
+		low := c.BurstLow
+		if low < 0 {
+			low = 0
+		}
+		if low > 1 {
+			low = 1
+		}
+		half := period / 2
+		perCycle := c.Rate*half + c.Rate*low*half
+
+		cycles := math.Floor(t / period)
+		total := cycles * perCycle
+		rest := t - cycles*period
+		if rest <= half {
+			return total + c.Rate*rest
+		}
+		return total + c.Rate*half + c.Rate*low*(rest-half)
+
+	default:
+		return c.Rate * t
+	}
+}
+
+// timeFor is the moment demand reached n sessions, found by bisection because
+// the burst shape has no tidy inverse. Paced runs set sessions up at rates a
+// server can answer, so a few dozen arithmetic steps per session costs nothing
+// next to the exchange it schedules.
+func (c *Config) timeFor(n float64) time.Duration {
+	if c.Rate <= 0 || n <= 0 {
+		return 0
+	}
+
+	// Grow an upper bound until demand passes n.
+	hi := time.Second
+	for c.sessionsBy(hi) < n {
+		hi *= 2
+		if hi > 24*time.Hour {
+			return hi
+		}
+	}
+
+	lo := time.Duration(0)
+	for i := 0; i < 40 && hi-lo > time.Microsecond; i++ {
+		mid := lo + (hi-lo)/2
+		if c.sessionsBy(mid) < n {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return hi
+}
+
+func (c *Config) rateAt(elapsed time.Duration) float64 {
+	if c.Rate <= 0 {
+		return 0 // unpaced
+	}
+	switch c.shape() {
+	case ShapeStampede:
+		return 0 // everything at once
+	case ShapeRamp:
+		if c.Duration <= 0 {
+			return c.Rate
+		}
+		f := elapsed.Seconds() / c.Duration.Seconds()
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		return c.Rate * f
+	case ShapeBurst:
+		period := c.burstPeriod()
+		low := c.BurstLow
+		if low < 0 {
+			low = 0
+		}
+		if low > 1 {
+			low = 1
+		}
+		if math.Mod(elapsed.Seconds(), period.Seconds()) < period.Seconds()/2 {
+			return c.Rate
+		}
+		return c.Rate * low
+	default:
+		return c.Rate
+	}
+}
+
 func (c *Config) terminateCause() uint32 {
 	if c.TerminateCause > 0 {
 		return c.TerminateCause
@@ -174,8 +363,16 @@ func (c *Config) validate() error {
 		return errors.New("engine: no username given")
 	case c.Count == 0 && c.Duration == 0:
 		return errors.New("engine: a run needs either a session count or a duration")
-	case c.Auth != AuthPAP && c.Auth != AuthCHAP:
+	case c.Auth != AuthPAP && c.Auth != AuthCHAP && c.Auth != AuthIPoE:
 		return fmt.Errorf("engine: unknown authentication method %q", c.Auth)
+	case c.RejectRate < 0 || c.RejectRate > 1:
+		return errors.New("engine: the reject rate must be between 0 and 1")
+	case c.TrafficUpMax > 0 && c.TrafficUpMax < c.TrafficUp:
+		return errors.New("engine: the upstream traffic maximum is below its minimum")
+	case c.TrafficDownMax > 0 && c.TrafficDownMax < c.TrafficDown:
+		return errors.New("engine: the downstream traffic maximum is below its minimum")
+	case c.Shape == ShapeRamp && c.Duration <= 0:
+		return errors.New("engine: a ramp needs a duration to climb across")
 	case c.accounting() && c.InterimInterval < 0:
 		return errors.New("engine: interim interval cannot be negative")
 	}

@@ -1,5 +1,8 @@
 bin/
 dist/
+# The interface's built assets are the exception: they are committed so that
+# building radblaster needs only Go, with no node toolchain in the way.
+!internal/web/dist/
 coverage.out
 coverage.html
 

@@ -31,7 +31,7 @@ func runLoad(args []string) error {
 		secret   = fs.String("secret", "", "shared secret, or set RADBLASTER_SECRET")
 		user     = fs.String("user", "subscriber{n}@example.net", "User-Name template; {n} is the session number")
 		password = fs.String("password", "", "password to authenticate with")
-		chap     = fs.Bool("chap", false, "authenticate with CHAP instead of PAP")
+		access   = fs.String("access", "pap", "access method: pap, chap or ipoe")
 
 		rate     = fs.Float64("rate", 0, "sessions to set up per second; 0 goes as fast as possible")
 		count    = fs.Uint64("count", 0, "stop after this many sessions")
@@ -39,8 +39,15 @@ func runLoad(args []string) error {
 		hold     = fs.Duration("hold", 0, "how long each session stays online before it is torn down")
 		interim  = fs.Duration("interim", 0, "interim update period when the server does not specify one")
 
-		up   = fs.Uint64("traffic-up", 0, "octets per second each session reports as sent")
-		down = fs.Uint64("traffic-down", 0, "octets per second each session reports as received")
+		up      = fs.Uint64("traffic-up", 0, "octets per second a session reports as sent")
+		upMax   = fs.Uint64("traffic-up-max", 0, "upper end of the upstream range; each session draws its own")
+		down    = fs.Uint64("traffic-down", 0, "octets per second a session reports as received")
+		downMax = fs.Uint64("traffic-down-max", 0, "upper end of the downstream range")
+
+		shape       = fs.String("shape", "steady", "load shape: steady, ramp, burst or stampede")
+		burstPeriod = fs.Duration("burst-period", 0, "one full cycle of the burst shape")
+		burstLow    = fs.Float64("burst-low", 0, "fraction of the rate offered during the quiet half of a burst")
+		rejectRate  = fs.Float64("reject-rate", 0, "fraction of sessions given a username the server will not know")
 
 		links   = fs.Int("links", 0, "source ports per endpoint; 0 picks a default")
 		timeout = fs.Duration("timeout", 5*time.Second, "how long to wait for a reply before trying again")
@@ -70,6 +77,9 @@ func runLoad(args []string) error {
 		fmt.Fprintln(os.Stderr, "Accounting-Stop. The shared secret is read from RADBLASTER_SECRET if")
 		fmt.Fprintln(os.Stderr, "-secret is not given, which keeps it out of the process list and the")
 		fmt.Fprintln(os.Stderr, "shell history.")
+		fmt.Fprintln(os.Stderr, "\nIPoE subscribers do not authenticate. With -access ipoe the password is")
+		fmt.Fprintln(os.Stderr, "the fixed service string the access node sends so the request carries one,")
+		fmt.Fprintln(os.Stderr, "the same for every subscriber, and the server identifies them by line.")
 		fmt.Fprintln(os.Stderr, "\nradblaster ships definitions for the RFC attributes only. For vendor")
 		fmt.Fprintln(os.Stderr, "attributes, point -dictionary at the dictionary files your own RADIUS")
 		fmt.Fprintln(os.Stderr, "server already uses, so both ends resolve the same names to the same")
@@ -114,9 +124,30 @@ func runLoad(args []string) error {
 		specs = append(specs, spec)
 	}
 
-	auth := engine.AuthPAP
-	if *chap {
+	var auth engine.Auth
+	switch strings.ToLower(*access) {
+	case "pap":
+		auth = engine.AuthPAP
+	case "chap":
 		auth = engine.AuthCHAP
+	case "ipoe":
+		auth = engine.AuthIPoE
+	default:
+		return fmt.Errorf("unknown access method %q, want pap, chap or ipoe", *access)
+	}
+
+	var loadShape engine.Shape
+	switch strings.ToLower(*shape) {
+	case "steady":
+		loadShape = engine.ShapeSteady
+	case "ramp":
+		loadShape = engine.ShapeRamp
+	case "burst":
+		loadShape = engine.ShapeBurst
+	case "stampede":
+		loadShape = engine.ShapeStampede
+	default:
+		return fmt.Errorf("unknown load shape %q, want steady, ramp, burst or stampede", *shape)
 	}
 
 	var nasIPBytes []byte
@@ -138,7 +169,13 @@ func runLoad(args []string) error {
 		Hold:             *hold,
 		InterimInterval:  *interim,
 		TrafficUp:        *up,
+		TrafficUpMax:     *upMax,
 		TrafficDown:      *down,
+		TrafficDownMax:   *downMax,
+		Shape:            loadShape,
+		BurstPeriod:      *burstPeriod,
+		BurstLow:         *burstLow,
+		RejectRate:       *rejectRate,
 		Links:            *links,
 		Timeout:          *timeout,
 		Retries:          *retries,

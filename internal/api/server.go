@@ -14,10 +14,15 @@ import (
 	"github.com/ispx-limited/radblaster/internal/radius"
 )
 
-// streamInterval is how often a watching browser is sent an update. Fast
-// enough that a server starting to struggle is visible as it happens, slow
-// enough that a chart stays legible and the connection stays cheap.
-const streamInterval = 500 * time.Millisecond
+// sampleInterval is how often a run is sampled and pushed to anyone watching.
+// Fast enough that a server starting to struggle is visible as it happens,
+// slow enough that a chart stays legible and the connection stays cheap.
+const sampleInterval = 500 * time.Millisecond
+
+// maxSamples bounds the series a run keeps, so a soak measured in hours cannot
+// grow without limit. At the sampling interval this is a little over ten
+// minutes of detail.
+const maxSamples = 1200
 
 // Server owns the run the interface is driving.
 //
@@ -35,6 +40,12 @@ type Server struct {
 	result  *engine.Result
 	err     string
 	started time.Time
+	history []Sample
+	// latest is the most recent sample of a running run. Rates are deltas
+	// since the previous snapshot, so exactly one goroutine may take them:
+	// letting each watcher sample independently would split the deltas
+	// between them and every reader would see a fraction of the truth.
+	latest *Status
 
 	// watchers are the connected streams, each with a buffered channel so a
 	// slow browser cannot hold up the run or anyone else watching it.
@@ -125,11 +136,54 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 	s.result = nil
 	s.err = ""
 	s.started = time.Now()
+	s.history = nil
+	s.latest = nil
 	s.mu.Unlock()
 
+	go s.sample(runner)
 	go s.watch(runner)
 
 	writeJSON(w, http.StatusAccepted, s.status())
+}
+
+// sample is the single reader of the run's snapshots. It records the series
+// and tells everyone watching.
+func (s *Server) sample(runner *engine.Runner) {
+	ticker := time.NewTicker(sampleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-runner.Done():
+			return
+		case <-ticker.C:
+			snap := runner.Snapshot()
+			st := s.statusFromSnapshot(snap)
+
+			s.mu.Lock()
+			if s.runner != runner {
+				s.mu.Unlock()
+				return
+			}
+			auth := snap.Access()
+			s.history = append(s.history, Sample{
+				T:        snap.Elapsed.Milliseconds(),
+				Offered:  snap.SetupRate,
+				Answered: snap.AnswerRate,
+				Lost:     snap.LossRate,
+				P95:      auth.Latency.Quantile(0.95),
+				Service:  auth.ServiceTime.Quantile(0.95),
+			})
+			if len(s.history) > maxSamples {
+				s.history = s.history[len(s.history)-maxSamples:]
+			}
+			st.History = append([]Sample(nil), s.history...)
+			s.latest = &st
+			s.mu.Unlock()
+
+			s.broadcast(st)
+		}
+	}
 }
 
 // watch collects the result once a run ends and tells everyone watching.
@@ -168,6 +222,31 @@ func (s *Server) getStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.status())
 }
 
+// statusFromSnapshot renders a live snapshot, without the history, which the
+// caller attaches under the lock.
+func (s *Server) statusFromSnapshot(snap engine.Snapshot) Status {
+	s.mu.Lock()
+	st := Status{State: s.state, Config: s.cfg, Error: s.err}
+	if !s.started.IsZero() {
+		st.StartedAt = s.started.UTC().Format(time.RFC3339)
+	}
+	s.mu.Unlock()
+
+	st.ElapsedMS = snap.Elapsed.Milliseconds()
+	for _, m := range snap.Exchanges {
+		st.Exchanges = append(st.Exchanges, exchangeOf(m))
+	}
+	st.DynAuth = dynAuthOf(snap.DynAuth)
+	st.SessionsStarted = snap.SessionsStarted
+	st.SessionsCompleted = snap.SessionsCompleted
+	st.SessionsOnline = snap.SessionsOnline
+	st.Outstanding = snap.Outstanding
+	st.SetupRate = snap.SetupRate
+	st.AnswerRate = snap.AnswerRate
+	st.LossRate = snap.LossRate
+	return st
+}
+
 // stream pushes the status to a browser as server-sent events.
 //
 // Sending the current state on connect means a browser that arrives partway
@@ -204,7 +283,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticker := time.NewTicker(streamInterval)
+	// Idle runs still get a heartbeat so a proxy in the path does not decide
+	// the connection has gone quiet and close it.
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -216,9 +297,10 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-ticker.C:
-			if !send(s.status()) {
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
 				return
 			}
+			flusher.Flush()
 		}
 	}
 }
@@ -254,30 +336,23 @@ func (s *Server) broadcast(st Status) {
 // from the finished result otherwise.
 func (s *Server) status() Status {
 	s.mu.Lock()
-	state, cfg, runner, result, errText, started := s.state, s.cfg, s.runner, s.result, s.err, s.started
+	state, cfg, result, errText, started := s.state, s.cfg, s.result, s.err, s.started
+	latest, history := s.latest, append([]Sample(nil), s.history...)
 	s.mu.Unlock()
 
-	st := Status{State: state, Config: cfg, Error: errText}
+	// A running run is reported from the sampler's most recent reading rather
+	// than by taking another, so every reader sees the same numbers and the
+	// rate deltas are not split between them.
+	if state == StateRunning && latest != nil {
+		return *latest
+	}
+
+	st := Status{State: state, Config: cfg, Error: errText, History: history}
 	if !started.IsZero() {
 		st.StartedAt = started.UTC().Format(time.RFC3339)
 	}
 
 	switch {
-	case state == StateRunning && runner != nil:
-		snap := runner.Snapshot()
-		st.ElapsedMS = snap.Elapsed.Milliseconds()
-		for _, m := range snap.Exchanges {
-			st.Exchanges = append(st.Exchanges, exchangeOf(m))
-		}
-		st.DynAuth = dynAuthOf(snap.DynAuth)
-		st.SessionsStarted = snap.SessionsStarted
-		st.SessionsCompleted = snap.SessionsCompleted
-		st.SessionsOnline = snap.SessionsOnline
-		st.Outstanding = snap.Outstanding
-		st.SetupRate = snap.SetupRate
-		st.AnswerRate = snap.AnswerRate
-		st.LossRate = snap.LossRate
-
 	case result != nil:
 		st.ElapsedMS = result.Elapsed.Milliseconds()
 		for _, m := range result.Exchanges {

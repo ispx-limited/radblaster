@@ -12,9 +12,16 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) \
            -X $(MODULE)/internal/version.Commit=$(COMMIT) \
            -X $(MODULE)/internal/version.Date=$(DATE)
 
-.PHONY: all build test test-race bench lint fmt fmt-check vet tidy clean
+.PHONY: all build ui test test-race bench lint fmt fmt-check vet tidy clean
 
 all: build
+
+# The interface's built assets are committed, so a plain build needs only Go.
+# Run "make ui" after changing anything under ui/.
+ui:
+	cd ui && pnpm install --frozen-lockfile && pnpm build
+	rm -rf internal/web/dist
+	cp -r ui/dist internal/web/dist
 
 build:
 	@mkdir -p $(BIN_DIR)

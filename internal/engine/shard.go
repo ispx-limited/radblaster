@@ -140,24 +140,25 @@ func (s *shard) run(ctx context.Context, started time.Time, seq *counter) {
 	s.expireAll()
 }
 
-// schedule returns the gap between this shard's own session setups and the
-// offset that staggers it against the other shards.
-func (s *shard) schedule() (interval, phase time.Duration) {
-	if s.cfg.Rate <= 0 {
-		return 0, 0
-	}
-	interval = time.Duration(float64(time.Second) * float64(s.total) / s.cfg.Rate)
-	phase = time.Duration(float64(time.Second) * float64(s.index) / s.cfg.Rate)
-	return interval, phase
+// nthSession is the run-wide position of this shard's n-th session, counting
+// from one. Shards take every total-th session, which interleaves them without
+// any coordination.
+func (s *shard) nthSession(n uint64) float64 {
+	return float64((n-1)*uint64(s.total) + uint64(s.index) + 1)
 }
 
 func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
-	interval, phase := s.schedule()
-	unpaced := interval == 0
-
-	var setups uint64
-	nextSetup := started.Add(phase)
 	lastSweep := started
+
+	// Whether a run is paced is a property of its settings, not of the rate at
+	// any one moment. A ramp starts at zero and climbs, so asking for the rate
+	// at the start would read as unpaced and stay that way for the whole run.
+	unpaced := s.cfg.Rate <= 0 || s.cfg.shape() == ShapeStampede
+
+	// mine counts the sessions this shard has set up. The next one is due when
+	// run-wide demand reaches its position.
+	var mine uint64
+	nextSetup := started.Add(s.cfg.timeFor(s.nthSession(1)))
 
 	for {
 		if ctx.Err() != nil {
@@ -198,11 +199,11 @@ func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 				dueAt = nextSetup
 			}
 			s.startSession(n, dueAt)
-			setups++
 			batch++
 
 			if !unpaced {
-				nextSetup = started.Add(phase + time.Duration(setups)*interval)
+				mine++
+				nextSetup = started.Add(s.cfg.timeFor(s.nthSession(mine + 1)))
 			}
 			if batch >= maxBatch {
 				break
@@ -384,7 +385,7 @@ func (s *shard) startSession(seq uint64, dueAt time.Time) {
 	s.mu.Lock()
 	idx := s.nextIdx
 	s.nextIdx++
-	sess := newSession(idx, seq, s.cfg, s.runID)
+	sess := newSession(idx, seq, s.cfg, s.runID, s.rng)
 	s.sessions[idx] = sess
 	s.lastSetupAt = time.Now()
 	s.mu.Unlock()

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/binary"
+	"math/rand/v2"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -510,5 +512,170 @@ func TestBadExtraAttributeFailsAtStartup(t *testing.T) {
 
 	if _, err := Run(context.Background(), cfg); err == nil {
 		t.Error("expected the run to be refused, not to drop the attribute silently")
+	}
+}
+
+// TestIPoESendsAServicePassword covers the correction that IPoE subscribers do
+// not authenticate: the access node has no credential, so it sends a fixed
+// string only because an Access-Request must carry one.
+func TestIPoESendsAServicePassword(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	cfg := sessionConfig(srv)
+	cfg.Auth = AuthIPoE
+	cfg.Password = "ipoe-service-secret"
+	cfg.Count = 3
+	cfg.Hold = 60 * time.Millisecond
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	var seen int
+	for _, p := range srv.requests {
+		if p.Code != radius.CodeAccessRequest {
+			continue
+		}
+		seen++
+		if p.Get(radius.AttrCHAPPassword) != nil {
+			t.Error("an IPoE request carried CHAP-Password")
+		}
+		if p.Get(radius.AttrUserPassword) == nil {
+			t.Error("an IPoE request carried no User-Password; the protocol requires one")
+		}
+	}
+	if seen != 3 {
+		t.Errorf("saw %d Access-Requests, want 3", seen)
+	}
+}
+
+// TestTrafficRangeGivesSubscribersTheirOwnRate keeps an estate from looking
+// like one subscriber repeated.
+func TestTrafficRangeGivesSubscribersTheirOwnRate(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	cfg := sessionConfig(srv)
+	cfg.Count = 40
+	cfg.Hold = 120 * time.Millisecond
+	cfg.InterimInterval = time.Hour // keep to a start and a stop each
+	cfg.TrafficUp = 1_000_000
+	cfg.TrafficUpMax = 20_000_000
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	seen := make(map[uint32]bool)
+	for _, p := range srv.seen(acctStop) {
+		if v, ok := p.GetUint32(radius.AttrAcctInputOctets); ok {
+			seen[v] = true
+		}
+	}
+	if len(seen) < 5 {
+		t.Errorf("only %d distinct octet counts across 40 subscribers; the range was not applied", len(seen))
+	}
+}
+
+// TestTrafficRangeIsReproducible pins the draw itself. Asserting on the octet
+// totals instead would be testing the wall clock, since those are the rate
+// multiplied by however long the session happened to be online.
+func TestTrafficRangeIsReproducible(t *testing.T) {
+	cfg := &Config{
+		Username:       "subscriber{n}@example.net",
+		TrafficUp:      1_000_000,
+		TrafficUpMax:   20_000_000,
+		TrafficDown:    5_000_000,
+		TrafficDownMax: 90_000_000,
+		RejectRate:     0.25,
+	}
+
+	draw := func() []session {
+		rng := rand.New(rand.NewPCG(42, 42))
+		out := make([]session, 0, 20)
+		for i := uint64(1); i <= 20; i++ {
+			out = append(out, *newSession(uint32(i), i, cfg, 1, rng))
+		}
+		return out
+	}
+
+	a, b := draw(), draw()
+	distinctUp := make(map[uint64]bool)
+	rejects := 0
+	for i := range a {
+		if a[i].up != b[i].up || a[i].down != b[i].down {
+			t.Fatalf("session %d drew %d/%d then %d/%d", i, a[i].up, a[i].down, b[i].up, b[i].down)
+		}
+		if a[i].reject != b[i].reject {
+			t.Fatalf("session %d was marked for rejection inconsistently", i)
+		}
+		if a[i].up < cfg.TrafficUp || a[i].up > cfg.TrafficUpMax {
+			t.Errorf("session %d drew %d, outside the configured range", i, a[i].up)
+		}
+		distinctUp[a[i].up] = true
+		if a[i].reject {
+			rejects++
+		}
+	}
+	if len(distinctUp) < 5 {
+		t.Errorf("only %d distinct rates across 20 subscribers", len(distinctUp))
+	}
+	if rejects == 0 {
+		t.Error("no session was marked for rejection at a quarter reject rate")
+	}
+}
+
+// TestRejectRateExercisesTheRejectionPath matters because rejection is often a
+// different and slower path than acceptance, and a platform that only ever
+// sees valid credentials in testing has never had it measured.
+func TestRejectRateExercisesTheRejectionPath(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	cfg := sessionConfig(srv)
+	cfg.Count = 100
+	cfg.Hold = 40 * time.Millisecond
+	cfg.RejectRate = 0.3
+	cfg.Seed = 7
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var unknown int
+	srv.mu.Lock()
+	for _, p := range srv.requests {
+		if p.Code != radius.CodeAccessRequest {
+			continue
+		}
+		if strings.Contains(string(p.Get(radius.AttrUserName)), "radblaster-unknown") {
+			unknown++
+		}
+	}
+	srv.mu.Unlock()
+
+	// Roughly thirty of a hundred; allow wide slack for the draw.
+	if unknown < 15 || unknown > 50 {
+		t.Errorf("%d of 100 sessions used an unknown username, want roughly 30", unknown)
+	}
+}
+
+func TestRejectRateZeroLeavesUsernamesAlone(t *testing.T) {
+	srv := newAcctServer(t, &acctServer{})
+
+	cfg := sessionConfig(srv)
+	cfg.Count = 20
+	cfg.Hold = 40 * time.Millisecond
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for _, p := range srv.requests {
+		if strings.Contains(string(p.Get(radius.AttrUserName)), "radblaster-unknown") {
+			t.Fatal("a session used an unknown username with the reject rate at zero")
+		}
 	}
 }
