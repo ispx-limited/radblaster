@@ -254,7 +254,7 @@ func (s *shard) wait(ctx context.Context, now, nextSetup time.Time, unpaced, blo
 
 // drain waits for outstanding requests to be answered or to time out.
 func (s *shard) drain(ctx context.Context) {
-	deadline := time.Now().Add(s.cfg.timeout())
+	deadline := time.Now().Add(s.cfg.totalWait())
 	for time.Now().Before(deadline) {
 		if s.pendingCount() == 0 {
 			return
@@ -545,19 +545,25 @@ func (s *shard) transmit(l *link, p *radius.Packet, sess *session, e Exchange, i
 	if dueAt.IsZero() {
 		dueAt = sentAt
 	}
-	l.pending[id] = pending{
+	slot := &l.pending[id]
+	*slot = pending{
 		active:   true,
 		session:  sess.index,
 		exchange: e,
 		auth:     p.Authenticator,
 		dueAt:    dueAt,
 		sentAt:   sentAt,
+		// Reuse the slot's buffer; the encoder's own is overwritten by its
+		// next call, so the bytes have to be kept here to be repeatable.
+		wire:     append(slot.wire[:0], wire...),
+		attempts: 1,
+		retryAt:  sentAt.Add(s.cfg.timeout()),
 	}
 	s.metrics[e].Sent++
 
 	// The encoder's buffer is reused on its next call, so the bytes must go
 	// out before the lock is released.
-	_, werr := l.conn.Write(wire)
+	_, werr := l.conn.Write(slot.wire)
 	if werr != nil {
 		l.pending[id].active = false
 		l.ids.Put(id)
@@ -674,33 +680,54 @@ func (s *shard) onAuthenticated(sess *session, at time.Time) {
 	heap.Push(&s.due, sess)
 }
 
-// expire releases requests that have gone unanswered past the timeout.
+// expire retransmits requests whose wait has elapsed, and gives up on the ones
+// that have used all their attempts.
+//
+// A retransmission repeats the exact bytes already sent, so the identifier and
+// authenticator are unchanged and a server that has already answered can
+// recognise it as a duplicate rather than treating it as new work.
 func (s *shard) expire(now time.Time) {
-	timeout := s.cfg.timeout()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for _, l := range []*link{s.auth, s.acct} {
 		if l == nil {
 			continue
 		}
 		for i := range l.pending {
 			p := &l.pending[i]
-			if !p.active || now.Sub(p.sentAt) < timeout {
+			if !p.active || now.Before(p.retryAt) {
 				continue
 			}
-			p.active = false
-			s.metrics[p.exchange].Timeouts++
-			l.ids.Put(uint8(i))
 
-			// A session whose authentication was never answered cannot go
-			// online, so it is finished rather than left in the table.
-			if p.exchange == ExchangeAccess {
-				if sess := s.sessions[p.session]; sess != nil && sess.state == stateAuthenticating {
-					delete(s.sessions, sess.index)
-					sess.state = stateDone
+			if p.attempts <= s.cfg.Retries {
+				p.attempts++
+				p.retryAt = now.Add(s.cfg.retryDelay(p.attempts))
+				s.metrics[p.exchange].Retransmits++
+				if _, err := l.conn.Write(p.wire); err != nil {
+					s.giveUp(l, uint8(i), p)
 				}
+				continue
 			}
+
+			s.giveUp(l, uint8(i), p)
+		}
+	}
+}
+
+// giveUp records a request as lost and releases its identifier. The caller
+// holds the lock.
+func (s *shard) giveUp(l *link, id uint8, p *pending) {
+	p.active = false
+	s.metrics[p.exchange].Timeouts++
+	l.ids.Put(id)
+
+	// A session whose authentication was never answered cannot come online,
+	// so it is finished rather than left in the table.
+	if p.exchange == ExchangeAccess {
+		if sess := s.sessions[p.session]; sess != nil && sess.state == stateAuthenticating {
+			delete(s.sessions, sess.index)
+			sess.state = stateDone
 		}
 	}
 }

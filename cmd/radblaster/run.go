@@ -43,7 +43,8 @@ func runLoad(args []string) error {
 		down = fs.Uint64("traffic-down", 0, "octets per second each session reports as received")
 
 		links   = fs.Int("links", 0, "source ports per endpoint; 0 picks a default")
-		timeout = fs.Duration("timeout", 5*time.Second, "how long to wait for a reply")
+		timeout = fs.Duration("timeout", 5*time.Second, "how long to wait for a reply before trying again")
+		retries = fs.Int("retries", 2, "times to repeat an unanswered request; 0 measures raw loss")
 
 		nasID     = fs.String("nas-id", "", "NAS-Identifier to send")
 		nasIP     = fs.String("nas-ip", "", "NAS-IP-Address to send")
@@ -140,6 +141,7 @@ func runLoad(args []string) error {
 		TrafficDown:      *down,
 		Links:            *links,
 		Timeout:          *timeout,
+		Retries:          *retries,
 		Auth:             auth,
 		Username:         *user,
 		Password:         *password,
@@ -187,13 +189,13 @@ func report(w io.Writer, res *engine.Result) {
 	fmt.Fprintf(w, "Run finished in %s\n\n", res.Elapsed.Round(time.Millisecond))
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "Exchange\tSent\tOK\tRejected\tTimed out\tUnverified\tp50\tp95\tp99\n")
+	fmt.Fprintf(tw, "Exchange\tSent\tOK\tRejected\tRetried\tLost\tUnverified\tp50\tp95\tp99\n")
 	for _, m := range res.Exchanges {
 		if m.Sent == 0 {
 			continue
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			m.Name, m.Sent, m.Accepted, m.Rejected, m.Timeouts, m.Unverified,
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			m.Name, m.Sent, m.Accepted, m.Rejected, m.Retransmits, m.Timeouts, m.Unverified,
 			fmtDur(m.Latency.Quantile(0.5)),
 			fmtDur(m.Latency.Quantile(0.95)),
 			fmtDur(m.Latency.Quantile(0.99)))
@@ -303,6 +305,12 @@ func warn(w io.Writer, res *engine.Result) {
 	}
 
 	for _, e := range res.Exchanges {
+		if e.Retransmits > 0 && e.Sent > 0 {
+			notes = append(notes, fmt.Sprintf(
+				"%s needed %d retransmissions across %d requests. Retries hide loss in the success "+
+					"rate, so this is the figure that shows the path or the server dropping packets.",
+				e.Name, e.Retransmits, e.Sent))
+		}
 		if e.Timeouts > 0 {
 			notes = append(notes, fmt.Sprintf(
 				"%d of %d %s requests (%.1f%%) were never answered.",

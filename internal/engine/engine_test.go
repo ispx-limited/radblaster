@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/binary"
@@ -28,11 +29,18 @@ type testServer struct {
 	code radius.Code
 	// silent drops every request.
 	silent atomic.Bool
+	// dropFirst drops this many packets before answering anything, which is
+	// how a lossy path is simulated.
+	dropFirst atomic.Int64
 	// delay is applied before replying.
 	delay time.Duration
 
 	received atomic.Uint64
-	wg       sync.WaitGroup
+
+	mu      sync.Mutex
+	packets [][]byte
+
+	wg sync.WaitGroup
 }
 
 func newTestServer(t *testing.T, s *testServer) *testServer {
@@ -72,12 +80,21 @@ func (s *testServer) serve() {
 			return
 		}
 		s.received.Add(1)
+
+		// Record before deciding whether to answer, so a test can inspect
+		// packets that were deliberately dropped.
+		req := make([]byte, n)
+		copy(req, buf[:n])
+		s.mu.Lock()
+		s.packets = append(s.packets, req)
+		s.mu.Unlock()
+
 		if s.silent.Load() || n < radius.HeaderLen {
 			continue
 		}
-
-		req := make([]byte, n)
-		copy(req, buf[:n])
+		if s.dropFirst.Add(-1) >= 0 {
+			continue
+		}
 
 		reply := func() {
 			var reqAuth [radius.AuthenticatorLen]byte
@@ -398,5 +415,126 @@ func TestRunUsesCHAP(t *testing.T) {
 	}
 	if res.Access().Accepted != 25 {
 		t.Errorf("Accepted = %d, want 25", res.Access().Accepted)
+	}
+}
+
+// TestRetransmissionRecoversFromLoss is the behaviour a real access node has:
+// a request that goes unanswered is repeated rather than written off, so a
+// lossy path does not read as a failing server.
+func TestRetransmissionRecoversFromLoss(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+	srv.dropFirst.Store(10) // lose every first attempt
+
+	cfg := baseConfig(srv.addr())
+	cfg.Count = 10
+	cfg.Links = 1
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.Retries = 2
+
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	m := res.Access()
+	if m.Sent != 10 {
+		t.Errorf("Sent = %d, want 10; retransmissions are attempts, not new requests", m.Sent)
+	}
+	if m.Accepted != 10 {
+		t.Errorf("Accepted = %d, want 10 (timeouts %d)", m.Accepted, m.Timeouts)
+	}
+	if m.Retransmits == 0 {
+		t.Error("Retransmits = 0; the loss was covered up without being reported")
+	}
+	if m.Timeouts != 0 {
+		t.Errorf("Timeouts = %d, want 0; every request was answered in the end", m.Timeouts)
+	}
+}
+
+// TestRetransmissionRepeatsTheSameBytes matters because a server that already
+// answered must be able to recognise the duplicate. A fresh identifier or
+// authenticator would look like new work and could be charged twice.
+func TestRetransmissionRepeatsTheSameBytes(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+	srv.silent.Store(true)
+
+	cfg := baseConfig(srv.addr())
+	cfg.Count = 1
+	cfg.Links = 1
+	cfg.Timeout = 80 * time.Millisecond
+	cfg.Retries = 2
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	srv.mu.Lock()
+	seen := append([][]byte(nil), srv.packets...)
+	srv.mu.Unlock()
+
+	if len(seen) < 2 {
+		t.Fatalf("server saw %d packets, want the original plus retransmissions", len(seen))
+	}
+	for i, p := range seen[1:] {
+		if !bytes.Equal(p, seen[0]) {
+			t.Errorf("retransmission %d differs from the original request", i+1)
+		}
+	}
+}
+
+// TestRetriesZeroDoesNotRetransmit keeps the raw-loss view available for
+// anyone measuring the path rather than simulating a node.
+func TestRetriesZeroDoesNotRetransmit(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+	srv.silent.Store(true)
+
+	cfg := baseConfig(srv.addr())
+	cfg.Count = 5
+	cfg.Links = 1
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.Retries = 0
+
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Access().Retransmits != 0 {
+		t.Errorf("Retransmits = %d, want 0", res.Access().Retransmits)
+	}
+	if res.Access().Timeouts != 5 {
+		t.Errorf("Timeouts = %d, want 5", res.Access().Timeouts)
+	}
+	if got := srv.received.Load(); got != 5 {
+		t.Errorf("server saw %d packets, want 5 with retransmission off", got)
+	}
+}
+
+// TestLatencyMeasuredFromTheOriginalSend checks that a request answered on a
+// later attempt still reports what the subscriber waited, not the time from
+// whichever copy happened to arrive.
+func TestLatencyMeasuredFromTheOriginalSend(t *testing.T) {
+	srv := newTestServer(t, &testServer{})
+	srv.dropFirst.Store(1)
+
+	cfg := baseConfig(srv.addr())
+	cfg.Count = 1
+	cfg.Links = 1
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.Retries = 2
+
+	res, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Access().Accepted != 1 {
+		t.Fatalf("Accepted = %d, want 1", res.Access().Accepted)
+	}
+
+	// The reply only came after the first attempt was lost and the retry
+	// fired, so the recorded time must span that wait.
+	if got := res.Access().ServiceTime.Max(); got < uint64(150*time.Millisecond) {
+		t.Errorf("service time = %v, want at least the retry wait; it was measured "+
+			"from the retransmission rather than the original request",
+			time.Duration(got))
 	}
 }

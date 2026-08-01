@@ -46,12 +46,12 @@ What works:
 - **Vendor-specific attributes**, resolved by name from the dictionary files
   your own RADIUS server already uses, or written by number with no dictionary
   at all
+- **Retransmission**, repeating the exact bytes so a server can recognise the
+  duplicate, with the retry count reported because retries otherwise hide loss
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- Retransmission during a load run; a request that goes unanswered is counted
-  as lost rather than retried
 - Live progress output; a run reports once it finishes
 - The web interface
 
@@ -113,6 +113,17 @@ Concurrency comes from sockets, not threads. The RADIUS identifier is one octet
 wide, so a single source port can only carry 256 requests at a time; `-links`
 sets how many ports to open per endpoint. If a run is limited by this rather
 than by the server, it says so and tells you the ceiling it hit.
+
+A request that goes unanswered is repeated, as a real access node would, and
+the wait doubles after each attempt. `-retries 0` turns that off when you want
+to measure raw loss on the path rather than simulate a node. Either way the
+retry count is reported separately, because retries hide loss in the success
+rate: a run that succeeds 100% of the time after 20,000 retransmissions is
+telling you something important about the path.
+
+Latency stays measured from the original request even when a later attempt is
+the one answered, since that is what a subscriber waited. A tail that jumps to
+the retry interval is real, not an artefact.
 
 Two latency columns are reported. The one measured from the scheduled send
 includes any time the generator spent falling behind its own schedule, and is

@@ -71,8 +71,13 @@ type Config struct {
 	// Each carries its own identifier space, so this sets the ceiling on
 	// outstanding requests at 256 per link. Zero picks a default.
 	Links int
-	// Timeout is how long a request may go unanswered before it is lost.
+	// Timeout is how long to wait for a reply before trying again.
 	Timeout time.Duration
+	// Retries is how many times an unanswered request is repeated before it
+	// is counted as lost. A real access node retransmits, so modelling it is
+	// the faithful default; the wait doubles after each attempt, as RFC 5080
+	// section 2.2.1 describes.
+	Retries int
 
 	Auth     Auth
 	Username string
@@ -123,6 +128,33 @@ func (c *Config) timeout() time.Duration {
 		return 5 * time.Second
 	}
 	return c.Timeout
+}
+
+// maxRetryInterval caps the exponential backoff so a long run cannot end up
+// waiting minutes between attempts.
+const maxRetryInterval = 16 * time.Second
+
+// totalWait is the longest a request can stay outstanding across every
+// attempt, which is how long a run must keep listening after its last send.
+func (c *Config) totalWait() time.Duration {
+	total := c.timeout()
+	for i := 1; i <= c.Retries; i++ {
+		total += c.retryDelay(i + 1)
+	}
+	return total
+}
+
+// retryDelay returns how long to wait before attempt number n, counting the
+// first transmission as attempt one.
+func (c *Config) retryDelay(attempts int) time.Duration {
+	d := c.timeout()
+	for i := 1; i < attempts && d < maxRetryInterval; i++ {
+		d *= 2
+	}
+	if d > maxRetryInterval {
+		d = maxRetryInterval
+	}
+	return d
 }
 
 func (c *Config) accounting() bool { return c.AcctServer != "" }
@@ -190,8 +222,13 @@ type Metrics struct {
 	Challenged uint64
 	Timeouts   uint64
 	Unverified uint64
-	Malformed  uint64
-	Unmatched  uint64
+
+	// Retransmits counts repeated attempts, not requests. A high count means
+	// first attempts are being lost, which is invisible in the success rate
+	// once the retries have covered it up.
+	Retransmits uint64
+	Malformed   uint64
+	Unmatched   uint64
 
 	// Blocked counts requests that could not be offered because every
 	// identifier on the chosen link was already outstanding. A non-zero value
@@ -226,6 +263,7 @@ func (m *Metrics) merge(o *Metrics) {
 	m.Challenged += o.Challenged
 	m.Timeouts += o.Timeouts
 	m.Unverified += o.Unverified
+	m.Retransmits += o.Retransmits
 	m.Malformed += o.Malformed
 	m.Unmatched += o.Unmatched
 	m.Blocked += o.Blocked

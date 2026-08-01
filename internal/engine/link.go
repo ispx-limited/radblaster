@@ -16,10 +16,25 @@ type pending struct {
 	session  uint32
 	exchange Exchange
 	auth     [radius.AuthenticatorLen]byte
+
 	// dueAt is when the request was scheduled to go out, which is what
-	// latency is measured against. sentAt is when it actually did.
+	// latency is measured against. sentAt is when the first attempt actually
+	// went out; retransmissions deliberately do not move it, because what a
+	// subscriber waited for is the time from the original request, not from
+	// whichever copy of it happened to arrive.
 	dueAt  time.Time
 	sentAt time.Time
+
+	// wire holds the exact bytes sent. A retransmission repeats them rather
+	// than re-encoding, so the identifier and authenticator are unchanged and
+	// a server that has already answered can recognise the duplicate instead
+	// of treating it as a new request.
+	wire []byte
+
+	// attempts counts transmissions including the first, and retryAt is when
+	// the next one falls due.
+	attempts int
+	retryAt  time.Time
 }
 
 // link is one UDP socket to one server endpoint, together with the identifier
