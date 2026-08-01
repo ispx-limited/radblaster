@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ispx-limited/radblaster/internal/engine"
+	"github.com/ispx-limited/radblaster/internal/profile"
 	"github.com/ispx-limited/radblaster/internal/radius"
 )
 
@@ -30,8 +31,9 @@ const maxSamples = 1200
 // identifier space and the source ports, so their results would interfere in
 // ways that are invisible in the numbers.
 type Server struct {
-	dict *radius.Dictionary
-	ui   fs.FS
+	dict     *radius.Dictionary
+	ui       fs.FS
+	profiles *profile.Store
 
 	mu      sync.Mutex
 	state   State
@@ -52,15 +54,16 @@ type Server struct {
 	watchers map[chan Status]struct{}
 }
 
-// New returns a server. ui may be nil, in which case only the interface's data
-// endpoints are served.
-func New(dict *radius.Dictionary, ui fs.FS) *Server {
+// New returns a server. ui may be nil, in which case only the data endpoints
+// are served, and profiles may be nil to run without a profile store.
+func New(dict *radius.Dictionary, ui fs.FS, profiles *profile.Store) *Server {
 	if dict == nil {
 		dict = radius.StandardDictionary()
 	}
 	return &Server{
 		dict:     dict,
 		ui:       ui,
+		profiles: profiles,
 		state:    StateIdle,
 		watchers: make(map[chan Status]struct{}),
 	}
@@ -73,6 +76,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/run", s.stopRun)
 	mux.HandleFunc("GET /api/status", s.getStatus)
 	mux.HandleFunc("GET /api/events", s.stream)
+	mux.HandleFunc("GET /api/profiles", s.listProfiles)
+	mux.HandleFunc("GET /api/profiles/{name}", s.getProfile)
+	mux.HandleFunc("PUT /api/profiles/{name}", s.putProfile)
+	mux.HandleFunc("DELETE /api/profiles/{name}", s.deleteProfile)
 
 	if s.ui != nil {
 		mux.Handle("/", http.FileServer(http.FS(s.ui)))
@@ -368,4 +375,80 @@ func (s *Server) status() Status {
 	}
 
 	return st
+}
+
+// noProfiles reports that the server was started without a store, so a caller
+// is told why rather than being given an empty list that looks like none saved.
+func (s *Server) noProfiles(w http.ResponseWriter) bool {
+	if s.profiles != nil {
+		return false
+	}
+	writeError(w, http.StatusNotImplemented, errors.New("this instance was started without a profile directory"))
+	return true
+}
+
+func (s *Server) listProfiles(w http.ResponseWriter, _ *http.Request) {
+	if s.noProfiles(w) {
+		return
+	}
+	names, err := s.profiles.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if names == nil {
+		names = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": names, "dir": s.profiles.Dir()})
+}
+
+func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
+	if s.noProfiles(w) {
+		return
+	}
+	p, err := s.profiles.Get(r.PathValue("name"))
+	if err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, profile.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeError(w, code, err)
+		return
+	}
+	// Returned as run settings so the interface can load it straight into the
+	// form, with the credentials left empty for the operator to supply.
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p, "config": FromProfile(p)})
+}
+
+func (s *Server) putProfile(w http.ResponseWriter, r *http.Request) {
+	if s.noProfiles(w) {
+		return
+	}
+	var cfg RunConfig
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("could not read the profile: %w", err))
+		return
+	}
+
+	p := cfg.ToProfile(r.PathValue("name"))
+	if err := s.profiles.Put(p); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p})
+}
+
+func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
+	if s.noProfiles(w) {
+		return
+	}
+	if err := s.profiles.Delete(r.PathValue("name")); err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, profile.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeError(w, code, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

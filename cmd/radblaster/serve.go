@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ispx-limited/radblaster/internal/api"
+	"github.com/ispx-limited/radblaster/internal/profile"
 	"github.com/ispx-limited/radblaster/internal/radius"
 	"github.com/ispx-limited/radblaster/internal/web"
 )
@@ -19,8 +20,9 @@ import (
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
-		addr  = fs.String("addr", "127.0.0.1:8080", "address to serve the interface on")
-		dicts stringList
+		addr     = fs.String("addr", "127.0.0.1:8080", "address to serve the interface on")
+		profiles = fs.String("profiles", "profiles", "directory to keep saved profiles in")
+		dicts    stringList
 	)
 	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
 	fs.Usage = func() {
@@ -42,7 +44,12 @@ func runServe(args []string) error {
 		}
 	}
 
-	srv := api.New(dict, web.FS())
+	store, err := profile.NewStore(*profiles)
+	if err != nil {
+		return err
+	}
+
+	srv := api.New(dict, web.FS(), store)
 	defer srv.Close()
 
 	httpSrv := &http.Server{
@@ -56,6 +63,7 @@ func runServe(args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "radblaster is at http://%s\n", ln.Addr())
+	fmt.Fprintf(os.Stderr, "Profiles are kept in %s\n", store.Dir())
 	if h, _, err := net.SplitHostPort(*addr); err == nil && (h == "" || h == "0.0.0.0" || h == "::") {
 		fmt.Fprintln(os.Stderr, "Warning: this is reachable from the network and has no authentication.")
 	}

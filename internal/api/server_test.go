@@ -57,7 +57,7 @@ func echoServer(t *testing.T) string {
 
 func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Helper()
-	srv := New(nil, nil)
+	srv := New(nil, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -302,7 +302,7 @@ func TestStreamSendsStateOnConnect(t *testing.T) {
 }
 
 func TestUIIsServedWhenPresent(t *testing.T) {
-	srv := New(nil, testUI{})
+	srv := New(nil, testUI{}, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	defer srv.Close()

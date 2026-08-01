@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ispx-limited/radblaster/internal/engine"
+	"github.com/ispx-limited/radblaster/internal/profile"
 	"github.com/ispx-limited/radblaster/internal/radius"
 	"github.com/ispx-limited/radblaster/internal/stats"
 )
@@ -66,6 +67,7 @@ func runLoad(args []string) error {
 
 		seed = fs.Uint64("seed", 0, "seed for a reproducible run; 0 draws a fresh one")
 	)
+	profilePath := fs.String("profile", "", "profile file to take settings from; flags override it")
 	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
 	fs.Var(&attrs, "attr", "extra attribute as Name=value, repeatable; {n} is the session number")
 	fs.Usage = func() {
@@ -88,6 +90,25 @@ func runLoad(args []string) error {
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// A profile supplies the settings, then any flag given on the command line
+	// overrides it, so one saved estate can be pointed at a different server
+	// or run at a different rate without editing the file.
+	if *profilePath != "" {
+		p, err := profile.LoadFile(*profilePath)
+		if err != nil {
+			return err
+		}
+		applyProfile(fs, p, &profileOverrides{
+			server: server, acct: acct, user: user, access: access,
+			rate: rate, count: count, duration: duration, hold: hold, interim: interim,
+			up: up, upMax: upMax, down: down, downMax: downMax,
+			shape: shape, burstPeriod: burstPeriod, burstLow: burstLow, rejectRate: rejectRate,
+			links: links, timeout: timeout, retries: retries,
+			nasID: nasID, nasIP: nasIP, nasPortID: nasPortID, calling: calling, portType: portType,
+			coaListen: coaListen, seed: seed, attrs: &attrs, dicts: &dicts,
+		})
 	}
 
 	if *secret == "" {

@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Radio } from "lucide-react";
-import { api, ApiError, emptyStatus, type Status } from "@/lib/api";
+import { api, ApiError, blankConfig, emptyStatus, toWire, type RunConfig, type Status } from "@/lib/api";
 import { elapsed } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { RunForm } from "@/components/run-form";
+import { RunSidebar } from "@/components/run-sidebar";
+import { ProfilePanel } from "@/components/profile-panel";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatCards } from "@/components/stat-cards";
 import { ExchangeTable, DynAuthTable } from "@/components/exchange-table";
 import { RateChart, LatencyChart } from "@/components/charts";
@@ -35,7 +37,10 @@ function StateBadge({ state }: { state: Status["state"] }) {
 
 export default function App() {
   const [status, setStatus] = useState<Status>(emptyStatus);
+  const [cfg, setCfg] = useState<RunConfig>(blankConfig);
   const [error, setError] = useState<string>();
+
+  const set = (patch: Partial<RunConfig>) => setCfg((c) => ({ ...c, ...patch }));
 
   // The series comes from the server rather than being accumulated here, so a
   // reload or a browser joining partway through still sees the whole run.
@@ -68,10 +73,10 @@ export default function App() {
     };
   }, []);
 
-  async function start(cfg: Record<string, unknown>) {
+  async function start() {
     setError(undefined);
     try {
-      setStatus(await api.start(cfg));
+      setStatus(await api.start(toWire(cfg)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "could not start the run");
     }
@@ -99,18 +104,36 @@ export default function App() {
       </header>
 
       <main className="grid items-start gap-4 p-5 lg:grid-cols-[340px_1fr]">
-        <RunForm state={status.state} error={error ?? status.error} onStart={start} onStop={stop} />
+        <RunSidebar
+          cfg={cfg}
+          set={set}
+          state={status.state}
+          error={error ?? status.error}
+          onStart={start}
+          onStop={stop}
+        />
 
-        <div className="space-y-4">
-          <StatCards status={status} />
-          <div className="grid gap-4 xl:grid-cols-2">
-            <RateChart data={history} />
-            <LatencyChart data={history} />
-          </div>
-          <ExchangeTable status={status} />
-          <DynAuthTable status={status} />
-          <Notes notes={status.notes} />
-        </div>
+        <Tabs defaultValue="dashboard" className="gap-4">
+          <TabsList>
+            <TabsTrigger value="dashboard">Dashboard</TabsTrigger>
+            <TabsTrigger value="profile">Profile</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="dashboard" className="space-y-4">
+            <StatCards status={status} />
+            <div className="grid gap-4 xl:grid-cols-2">
+              <RateChart data={history} />
+              <LatencyChart data={history} />
+            </div>
+            <ExchangeTable status={status} />
+            <DynAuthTable status={status} />
+            <Notes notes={status.notes} />
+          </TabsContent>
+
+          <TabsContent value="profile">
+            <ProfilePanel cfg={cfg} set={set} replace={setCfg} state={status.state} />
+          </TabsContent>
+        </Tabs>
       </main>
     </div>
   );

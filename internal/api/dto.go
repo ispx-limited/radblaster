@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ispx-limited/radblaster/internal/engine"
+	"github.com/ispx-limited/radblaster/internal/profile"
 	"github.com/ispx-limited/radblaster/internal/radius"
 )
 
@@ -70,9 +71,10 @@ type RunConfig struct {
 	CallingStationID string `json:"callingStationId,omitempty"`
 	NASPortID        string `json:"nasPortId,omitempty"`
 
-	Attributes []string `json:"attributes,omitempty"`
-	CoAListen  string   `json:"coaListen,omitempty"`
-	Seed       uint64   `json:"seed,omitempty"`
+	Attributes   []profile.Attr `json:"attributes,omitempty"`
+	Dictionaries []string       `json:"dictionaries,omitempty"`
+	CoAListen    string         `json:"coaListen,omitempty"`
+	Seed         uint64         `json:"seed,omitempty"`
 }
 
 // redacted returns a copy safe to hand back to a client.
@@ -173,10 +175,11 @@ func (c RunConfig) toEngine(dict *radius.Dictionary) (engine.Config, error) {
 	}
 
 	for _, a := range c.Attributes {
-		if strings.TrimSpace(a) == "" {
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
 			continue
 		}
-		spec, err := dict.ParseSpec(a)
+		spec, err := dict.ParseSpec(name + "=" + a.Value)
 		if err != nil {
 			return cfg, err
 		}
@@ -328,4 +331,81 @@ type Status struct {
 	// than it appears to. Composing them here rather than in the browser keeps
 	// one source of truth with the command line.
 	Notes []string `json:"notes,omitempty"`
+}
+
+// ToProfile extracts the part of a run worth keeping, which is everything
+// except the credentials.
+func (c RunConfig) ToProfile(name string) *profile.Profile {
+	return &profile.Profile{
+		Name:       name,
+		Server:     c.Server,
+		AcctServer: c.AcctServer,
+		Access:     c.Auth,
+		Username:   c.Username,
+		Load: profile.Load{
+			Rate:        c.Rate,
+			Count:       c.Count,
+			Duration:    c.Duration,
+			Shape:       c.Shape,
+			BurstPeriod: c.BurstPeriod,
+			BurstLow:    c.BurstLow,
+			RejectRate:  c.RejectRate,
+			Links:       c.Links,
+			Timeout:     c.Timeout,
+			Retries:     c.Retries,
+		},
+		Session: profile.Session{Hold: c.Hold, Interim: c.Interim},
+		Traffic: profile.Traffic{
+			Up:   profile.Range{Min: c.TrafficUp, Max: c.TrafficUpMax},
+			Down: profile.Range{Min: c.TrafficDown, Max: c.TrafficDownMax},
+		},
+		NAS: profile.NAS{
+			Identifier:       c.NASIdentifier,
+			IPAddress:        c.NASIPAddress,
+			PortType:         c.NASPortType,
+			PortID:           c.NASPortID,
+			CallingStationID: c.CallingStationID,
+		},
+		Attributes:   c.Attributes,
+		Dictionaries: c.Dictionaries,
+		CoAListen:    c.CoAListen,
+		Seed:         c.Seed,
+	}
+}
+
+// FromProfile fills in a run from a profile. The credentials stay empty: a
+// profile never carries them, so they have to come from wherever the run is
+// being started.
+func FromProfile(p *profile.Profile) RunConfig {
+	return RunConfig{
+		Server:           p.Server,
+		AcctServer:       p.AcctServer,
+		Auth:             p.Access,
+		Username:         p.Username,
+		Rate:             p.Load.Rate,
+		Count:            p.Load.Count,
+		Duration:         p.Load.Duration,
+		Shape:            p.Load.Shape,
+		BurstPeriod:      p.Load.BurstPeriod,
+		BurstLow:         p.Load.BurstLow,
+		RejectRate:       p.Load.RejectRate,
+		Links:            p.Load.Links,
+		Timeout:          p.Load.Timeout,
+		Retries:          p.Load.Retries,
+		Hold:             p.Session.Hold,
+		Interim:          p.Session.Interim,
+		TrafficUp:        p.Traffic.Up.Min,
+		TrafficUpMax:     p.Traffic.Up.Max,
+		TrafficDown:      p.Traffic.Down.Min,
+		TrafficDownMax:   p.Traffic.Down.Max,
+		NASIdentifier:    p.NAS.Identifier,
+		NASIPAddress:     p.NAS.IPAddress,
+		NASPortType:      p.NAS.PortType,
+		NASPortID:        p.NAS.PortID,
+		CallingStationID: p.NAS.CallingStationID,
+		Attributes:       p.Attributes,
+		Dictionaries:     p.Dictionaries,
+		CoAListen:        p.CoAListen,
+		Seed:             p.Seed,
+	}
 }

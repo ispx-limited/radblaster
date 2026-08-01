@@ -52,11 +52,13 @@ What works:
   count, which moves before any latency figure does
 - **A web interface** for setting up a run, watching it live and reading the
   result, driven entirely through the same API the command line uses
+- **Profiles**: an estate saved as a YAML file the interface edits, the command
+  line runs, and you commit alongside whatever else describes that network
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- Saving and comparing past runs; each run stands alone
+- Comparing one run against another; each run stands alone
 - A downloadable report file
 
 ## Why it exists
@@ -158,6 +160,59 @@ includes any time the generator spent falling behind its own schedule, and is
 the honest figure for what a subscriber would experience. The one measured from
 the actual send is what the server took. When they diverge, the run could not
 keep pace and the result understates the load the server was asked to handle.
+
+### Profiles
+
+An estate is worth describing once. Save one from the interface, or write the
+file by hand, and run it from anywhere:
+
+```sh
+radblaster run -profile profiles/nokia-business.yaml
+```
+
+```yaml
+# radblaster profile
+name: nokia-business
+server: 10.0.0.1:1812
+acctServer: 10.0.0.1:1813
+access: ipoe
+username: sub-{n}@business.example.net
+load:
+    rate: 500
+    duration: 10m
+    shape: ramp
+    rejectRate: 0.02
+    retries: 2
+session:
+    hold: 30m
+    interim: 300s
+traffic:
+    up: {min: 1000000, max: 20000000}
+    down: {min: 5000000, max: 90000000}
+nas:
+    identifier: bng-lab-01
+    portId: eth 1/1/{n}
+dictionaries:
+    - /usr/share/radius/dictionary
+attributes:
+    - name: Cisco-AVPair
+      value: ip:qos-policy-in=voice
+```
+
+**A profile carries no shared secret and no password.** It is meant to be
+committed, and a credential in a file that is meant to be committed is a
+credential that will be. Supply them when the run starts, from
+`RADBLASTER_SECRET` or from the interface.
+
+Any flag given on the command line overrides the file, so one saved estate can
+be aimed at a different server or run at a different rate without editing it:
+
+```sh
+radblaster run -profile profiles/nokia-business.yaml -server 10.0.1.1 -duration 5m
+```
+
+A profile names the dictionaries its attribute names resolve through, because
+an estate that uses vendor attributes is not fully described without them.
 
 ### Vendor attributes
 
