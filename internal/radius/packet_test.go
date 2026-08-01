@@ -304,6 +304,119 @@ func TestDecodeRejectsMalformed(t *testing.T) {
 	}
 }
 
+// TestVerifyRequestAcceptsOurOwnDerivedRequests closes the loop between the
+// two directions: anything this package signs as a request must verify as one.
+func TestVerifyRequestAcceptsOurOwnDerivedRequests(t *testing.T) {
+	for _, code := range []Code{CodeAccountingRequest, CodeCoARequest, CodeDisconnectRequest} {
+		t.Run(code.String(), func(t *testing.T) {
+			p := &Packet{Code: code, Identifier: 5}
+			p.AddString(AttrUserName, "subscriber@example.net")
+			p.AddString(AttrAcctSessionID, "ABCD-0001")
+
+			b, err := p.Encode(nil, testSecret)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			if err := VerifyRequest(b, testSecret); err != nil {
+				t.Errorf("VerifyRequest: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRequestRejectsWrongSecret(t *testing.T) {
+	p := &Packet{Code: CodeDisconnectRequest, Identifier: 5}
+	p.AddString(AttrUserName, "subscriber@example.net")
+
+	b, err := p.Encode(nil, testSecret)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := VerifyRequest(b, []byte("wrong")); !errors.Is(err, ErrBadAuth) {
+		t.Errorf("err = %v, want ErrBadAuth", err)
+	}
+}
+
+func TestVerifyRequestRejectsTamperedBody(t *testing.T) {
+	p := &Packet{Code: CodeCoARequest, Identifier: 5}
+	p.AddString(AttrUserName, "subscriber@example.net")
+
+	b, err := p.Encode(nil, testSecret)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	b[len(b)-1] ^= 0xff
+
+	if err := VerifyRequest(b, testSecret); !errors.Is(err, ErrBadAuth) {
+		t.Errorf("err = %v, want ErrBadAuth", err)
+	}
+}
+
+// TestVerifyRequestChecksMessageAuthenticator matters for Access-Request,
+// where the authenticator is random and proves nothing by itself.
+func TestVerifyRequestChecksMessageAuthenticator(t *testing.T) {
+	_, b := buildAccessRequest(t)
+
+	if err := VerifyRequest(b, testSecret); err != nil {
+		t.Errorf("VerifyRequest on a well-formed Access-Request: %v", err)
+	}
+	if err := VerifyRequest(b, []byte("wrong")); !errors.Is(err, ErrBadMessageAuth) {
+		t.Errorf("err = %v, want ErrBadMessageAuth", err)
+	}
+}
+
+func TestVerifyRequestLeavesInputUntouched(t *testing.T) {
+	p := &Packet{Code: CodeDisconnectRequest, Identifier: 5}
+	p.AddString(AttrUserName, "subscriber@example.net")
+
+	b, err := p.Encode(nil, testSecret)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	before := append([]byte(nil), b...)
+
+	_ = VerifyRequest(b, testSecret)
+
+	if !bytes.Equal(b, before) {
+		t.Error("VerifyRequest mutated its input")
+	}
+}
+
+// TestEncodeResponseIsVerifiableByThePeer proves a reply we build is one the
+// requester will accept, which is what makes acting as a NAS work at all.
+func TestEncodeResponseIsVerifiableByThePeer(t *testing.T) {
+	req := &Packet{Code: CodeDisconnectRequest, Identifier: 77}
+	req.AddString(AttrUserName, "subscriber@example.net")
+	if _, err := req.Encode(nil, testSecret); err != nil {
+		t.Fatalf("Encode request: %v", err)
+	}
+
+	for _, code := range []Code{CodeDisconnectACK, CodeDisconnectNAK, CodeCoAACK, CodeCoANAK} {
+		t.Run(code.String(), func(t *testing.T) {
+			resp := &Packet{Code: code, Identifier: req.Identifier}
+			if code == CodeDisconnectNAK || code == CodeCoANAK {
+				resp.AddUint32(AttrErrorCause, 503) // Session-Context-Not-Found
+			}
+
+			b, err := resp.EncodeResponse(nil, testSecret, req.Authenticator)
+			if err != nil {
+				t.Fatalf("EncodeResponse: %v", err)
+			}
+			// Verify is what the peer would run against the reply.
+			if err := Verify(b, req.Authenticator, testSecret); err != nil {
+				t.Errorf("peer could not verify our reply: %v", err)
+			}
+		})
+	}
+}
+
+func TestEncodeResponseRejectsBadAuthenticatorLength(t *testing.T) {
+	p := &Packet{Code: CodeDisconnectACK, Identifier: 1}
+	if _, err := p.encode(nil, testSecret, []byte{1, 2, 3}, nil, nil); !errors.Is(err, ErrUnsignedCode) {
+		t.Errorf("err = %v, want ErrUnsignedCode", err)
+	}
+}
+
 // serverReply builds a response the way a compliant server would, so Verify is
 // tested against an independently constructed packet rather than our own
 // encoder.

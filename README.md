@@ -15,9 +15,9 @@ radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
 ## Status
 
 Early but useful. The full subscriber session lifecycle works end to end
-against a real RADIUS server, and on a desktop machine authentication alone
-sustains over 100,000 requests per second. CoA and the web interface are not
-built yet.
+against a real RADIUS server, including server-initiated disconnects, and on a
+desktop machine authentication alone sustains over 100,000 requests per second.
+The web interface is not built yet.
 
 What works:
 
@@ -41,11 +41,12 @@ What works:
   policy rejection are counted apart, because they need different remedies
 - Notes explaining what limited the run, including the throughput ceiling
   implied by the number of links and the server's response time
+- **Answers CoA-Request and Disconnect-Request** as an access node would, so a
+  bulk policy change or a mass disconnect can be tested from the server side
 - Reproducible runs with `-seed`
 
 What does not work yet:
 
-- CoA and Disconnect
 - Vendor-specific attributes and loading dictionary files
 - Retransmission during a load run; a request that goes unanswered is counted
   as lost rather than retried
@@ -116,6 +117,31 @@ includes any time the generator spent falling behind its own schedule, and is
 the honest figure for what a subscriber would experience. The one measured from
 the actual send is what the server took. When they diverge, the run could not
 keep pace and the result understates the load the server was asked to handle.
+
+### Change of authorisation and disconnect
+
+Give the run an address to listen on and it presents itself as an access node
+the server can push changes to:
+
+```sh
+radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
+               -password secret -count 5000 -hold 1h \
+               -coa-listen :3799
+```
+
+A Disconnect-Request naming a live session is acknowledged and the subscriber
+is torn down, with `Acct-Terminate-Cause` set to Admin-Reset so the accounting
+record says the server ended it rather than the subscriber. A CoA-Request can
+change the session's interim interval or its remaining time.
+
+Requests for a session that has already gone are refused with
+`Error-Cause = Session-Context-Not-Found`, and the count of those is the figure
+that matters when testing a bulk change: it is how many subscribers did not
+receive it.
+
+A request that fails verification is dropped without a reply rather than
+refused, because answering would confirm to an unauthenticated sender that the
+address is live.
 
 ### Single authentication
 

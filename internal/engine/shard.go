@@ -16,6 +16,11 @@ import (
 // sweep is cheap and a timer wheel would be machinery without a purpose.
 const sweepInterval = 20 * time.Millisecond
 
+// coaQueueDepth bounds the changes waiting for one shard. A full queue is
+// answered with Resources-Unavailable, which is a truthful answer the server
+// can act on, rather than an acknowledgement for work that was dropped.
+const coaQueueDepth = 1024
+
 // shard owns a slice of the simulated subscribers, together with the sockets
 // their traffic goes out on.
 //
@@ -37,6 +42,12 @@ type shard struct {
 	// read timeouts forever.
 	stopped atomic.Bool
 
+	// reg is the run-wide index a server-initiated request is resolved
+	// through, and coa carries the resulting changes to this shard so a
+	// session is only ever mutated by the worker that owns it.
+	reg *registry
+	coa chan coaEvent
+
 	// mu guards everything below. The critical sections are short and only
 	// three goroutines contend for them, so a mutex is cheaper here than the
 	// bookkeeping needed to avoid one.
@@ -56,7 +67,7 @@ type shard struct {
 	lastSetupAt time.Time
 }
 
-func newShard(cfg *Config, index, total int, runID uint32, r *rand.Rand) (*shard, error) {
+func newShard(cfg *Config, index, total int, runID uint32, r *rand.Rand, reg *registry) (*shard, error) {
 	s := &shard{
 		cfg:      cfg,
 		index:    index,
@@ -64,6 +75,8 @@ func newShard(cfg *Config, index, total int, runID uint32, r *rand.Rand) (*shard
 		runID:    runID,
 		rng:      r,
 		sessions: make(map[uint32]*session),
+		reg:      reg,
+		coa:      make(chan coaEvent, coaQueueDepth),
 	}
 	for e := range s.metrics {
 		s.metrics[e] = newMetrics(Exchange(e).String())
@@ -150,6 +163,10 @@ func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 			s.expire(now)
 			lastSweep = now
 		}
+
+		// Apply anything the server asked for before advancing sessions, so
+		// a disconnect takes effect rather than racing the next update.
+		s.drainCoA(now)
 
 		// Drive every session whose next step has come due.
 		s.advanceDue(now)
@@ -267,6 +284,65 @@ func (s *shard) pendingCount() int {
 	return n
 }
 
+// submitCoA hands a server-initiated change to this shard. It reports false
+// when the queue is full, which the caller answers with Resources-Unavailable
+// rather than dropping the request silently.
+func (s *shard) submitCoA(ev coaEvent) bool {
+	select {
+	case s.coa <- ev:
+		return true
+	default:
+		return false
+	}
+}
+
+// drainCoA applies every change waiting for this shard.
+func (s *shard) drainCoA(now time.Time) {
+	for {
+		select {
+		case ev := <-s.coa:
+			s.applyCoA(ev, now)
+		default:
+			return
+		}
+	}
+}
+
+// applyCoA carries out a change the server asked for.
+func (s *shard) applyCoA(ev coaEvent, now time.Time) {
+	s.mu.Lock()
+	sess := s.sessions[ev.index]
+	if sess == nil || sess.state != stateActive {
+		// The session finished between the listener acknowledging the request
+		// and this shard getting to it.
+		s.mu.Unlock()
+		return
+	}
+	// Take it out of the queue while its schedule is rewritten, so it cannot
+	// be advanced from under us.
+	if sess.queueIdx >= 0 {
+		heap.Remove(&s.due, sess.queueIdx)
+	}
+	s.mu.Unlock()
+
+	if ev.disconnect {
+		// A subscriber removed by the server still owes a final accounting
+		// record, and the cause has to say who ended it.
+		sess.state = stateAcctStop
+		s.sendAcct(sess, ExchangeAcctStop, acctStop, now, now, causeAdminReset)
+		s.finish(sess, true)
+		return
+	}
+
+	if ev.interim > 0 {
+		sess.interim = ev.interim
+	}
+	if ev.sessionTimeout > 0 {
+		sess.stopAt = sess.onlineAt.Add(ev.sessionTimeout)
+	}
+	s.scheduleNext(sess, now)
+}
+
 // canSetup reports whether a new session can be authenticated right now.
 func (s *shard) canSetup() bool {
 	s.mu.Lock()
@@ -332,7 +408,7 @@ func (s *shard) step(sess *session, now time.Time) {
 		sess.onlineAt = now
 		sess.stopAt = now.Add(s.cfg.Hold)
 		sess.state = stateActive
-		s.sendAcct(sess, ExchangeAcctStart, acctStart, sess.nextAt, now)
+		s.sendAcct(sess, ExchangeAcctStart, acctStart, sess.nextAt, now, 0)
 
 		s.mu.Lock()
 		s.sessionsStarted++
@@ -343,11 +419,11 @@ func (s *shard) step(sess *session, now time.Time) {
 	case stateActive:
 		if !now.Before(sess.stopAt) {
 			sess.state = stateAcctStop
-			s.sendAcct(sess, ExchangeAcctStop, acctStop, sess.nextAt, now)
+			s.sendAcct(sess, ExchangeAcctStop, acctStop, sess.nextAt, now, 0)
 			s.finish(sess, true)
 			return
 		}
-		s.sendAcct(sess, ExchangeAcctInterim, acctInterim, sess.nextAt, now)
+		s.sendAcct(sess, ExchangeAcctInterim, acctInterim, sess.nextAt, now, 0)
 		s.scheduleNext(sess, now)
 
 	default:
@@ -377,6 +453,9 @@ func (s *shard) scheduleNext(sess *session, now time.Time) {
 // finish removes a session from the shard.
 func (s *shard) finish(sess *session, completed bool) {
 	sess.state = stateDone
+	if s.reg != nil {
+		s.reg.remove(sess.acctSessionID)
+	}
 	s.mu.Lock()
 	delete(s.sessions, sess.index)
 	if completed {
@@ -412,7 +491,7 @@ func (s *shard) sendAccess(sess *session, dueAt time.Time) {
 }
 
 // sendAcct builds and sends one accounting record.
-func (s *shard) sendAcct(sess *session, e Exchange, status uint32, dueAt, now time.Time) {
+func (s *shard) sendAcct(sess *session, e Exchange, status uint32, dueAt, now time.Time, cause uint32) {
 	if s.acct == nil {
 		return
 	}
@@ -434,7 +513,7 @@ func (s *shard) sendAcct(sess *session, e Exchange, status uint32, dueAt, now ti
 		s.mu.Unlock()
 		return
 	}
-	sess.buildAcct(p, s.cfg, status, now)
+	sess.buildAcct(p, s.cfg, status, now, cause)
 
 	s.transmit(s.acct, p, sess, e, id, dueAt)
 }
@@ -589,6 +668,9 @@ func (s *shard) onAuthenticated(sess *session, at time.Time) {
 	}
 	sess.state = stateAcctStart
 	sess.nextAt = at
+	if s.reg != nil {
+		s.reg.add(sess.acctSessionID, sessionRef{shard: s.index, index: sess.index})
+	}
 	heap.Push(&s.due, sess)
 }
 
@@ -641,17 +723,32 @@ func (s *shard) expireAll() {
 }
 
 // sessionQueue orders sessions by when their next lifecycle step falls due.
+//
+// Each session tracks its own position so a server-initiated disconnect can
+// pull it out of the queue directly rather than scanning for it.
 type sessionQueue []*session
 
 func (q sessionQueue) Len() int           { return len(q) }
 func (q sessionQueue) Less(i, j int) bool { return q[i].nextAt.Before(q[j].nextAt) }
-func (q sessionQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
-func (q *sessionQueue) Push(x any)        { *q = append(*q, x.(*session)) }
+
+func (q sessionQueue) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+	q[i].queueIdx = i
+	q[j].queueIdx = j
+}
+
+func (q *sessionQueue) Push(x any) {
+	s := x.(*session)
+	s.queueIdx = len(*q)
+	*q = append(*q, s)
+}
+
 func (q *sessionQueue) Pop() any {
 	old := *q
 	n := len(old)
 	s := old[n-1]
 	old[n-1] = nil
+	s.queueIdx = -1
 	*q = old[:n-1]
 	return s
 }

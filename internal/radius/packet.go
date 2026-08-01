@@ -145,21 +145,46 @@ func (p *Packet) wantsMessageAuthenticator() bool {
 // Encode constructs its hash state per call. Callers sending at rate should
 // use an Encoder, which reuses both the hash state and the output buffer.
 func (p *Packet) Encode(dst, secret []byte) ([]byte, error) {
-	return p.encode(dst, secret, hmac.New(md5.New, secret), md5.New())
+	return p.encode(dst, secret, nil, hmac.New(md5.New, secret), md5.New())
 }
 
-// encode is the shared body of Encode and Encoder.Encode. mac must be an
+// EncodeResponse appends the wire form of a reply to dst and returns the
+// extended slice.
+//
+// reqAuthenticator is the authenticator of the request being answered. The
+// Response Authenticator is computed over the packet with that value in place,
+// per RFC 2865 section 3, which is what lets the peer tie the reply to its
+// request and prove we knew the shared secret.
+func (p *Packet) EncodeResponse(dst, secret []byte, reqAuthenticator [AuthenticatorLen]byte) ([]byte, error) {
+	return p.encode(dst, secret, reqAuthenticator[:], hmac.New(md5.New, secret), md5.New())
+}
+
+// encode is the shared body of the encoding entry points. mac must be an
 // HMAC-MD5 already keyed with secret; both hashes are reset before use.
-func (p *Packet) encode(dst, secret []byte, mac, digest hash.Hash) ([]byte, error) {
-	if !p.Code.isRequest() {
+//
+// respondTo is nil when encoding a request. When encoding a reply it holds the
+// authenticator of the request being answered, which both seeds the
+// authenticator field and is what the final digest is computed over.
+func (p *Packet) encode(dst, secret, respondTo []byte, mac, digest hash.Hash) ([]byte, error) {
+	response := respondTo != nil
+	if response {
+		if len(respondTo) != AuthenticatorLen {
+			return nil, ErrUnsignedCode
+		}
+	} else if !p.Code.isRequest() {
 		return nil, ErrUnsignedCode
 	}
 
 	start := len(dst)
 	dst = append(dst, byte(p.Code), p.Identifier, 0, 0)
-	if p.Code.randomAuthenticator() {
+	switch {
+	case response:
+		// The reply carries the request's authenticator while it is signed,
+		// and the digest computed over that replaces it below.
+		dst = append(dst, respondTo...)
+	case p.Code.randomAuthenticator():
 		dst = append(dst, p.Authenticator[:]...)
-	} else {
+	default:
 		// Derived authenticators are computed over a packet whose
 		// authenticator field reads as zero, then overwritten below.
 		dst = append(dst, zeros[:]...)
@@ -209,7 +234,7 @@ func (p *Packet) encode(dst, secret []byte, mac, digest hash.Hash) ([]byte, erro
 		mac.Sum(pkt[msgAuthOff : msgAuthOff : msgAuthOff+AuthenticatorLen])
 	}
 
-	if !p.Code.randomAuthenticator() {
+	if response || !p.Code.randomAuthenticator() {
 		digest.Reset()
 		digest.Write(pkt)
 		digest.Write(secret)
@@ -245,7 +270,19 @@ func NewEncoder(secret []byte) *Encoder {
 // Encode returns the wire form of p. The returned slice aliases the Encoder's
 // buffer and stays valid only until the next call to Encode.
 func (e *Encoder) Encode(p *Packet) ([]byte, error) {
-	b, err := p.encode(e.buf[:0], e.secret, e.mac, e.digest)
+	b, err := p.encode(e.buf[:0], e.secret, nil, e.mac, e.digest)
+	if err != nil {
+		return nil, err
+	}
+	e.buf = b
+	return b, nil
+}
+
+// EncodeResponse returns the wire form of a reply to a request that carried
+// reqAuthenticator. The returned slice aliases the Encoder's buffer and stays
+// valid only until the next call.
+func (e *Encoder) EncodeResponse(p *Packet, reqAuthenticator [AuthenticatorLen]byte) ([]byte, error) {
+	b, err := p.encode(e.buf[:0], e.secret, reqAuthenticator[:], e.mac, e.digest)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +382,80 @@ func Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte, secret []byte
 			copy(buf[i+2:i+alen], got[:])
 		}
 		i += alen
+	}
+
+	h := md5.New()
+	h.Write(buf)
+	h.Write(secret)
+	if !hmac.Equal(received[:], h.Sum(nil)) {
+		return ErrBadAuth
+	}
+	return nil
+}
+
+// VerifyRequest checks a received request.
+//
+// For Accounting-Request, CoA-Request and Disconnect-Request the authenticator
+// is derived from the packet contents and the shared secret (RFC 2866 section
+// 3, RFC 5176 section 3.3), so it proves the sender knew the secret and is
+// checked here. Access-Request carries an unpredictable value instead, which
+// proves nothing on its own; for those, only a Message-Authenticator can
+// establish authenticity, and a caller that requires one should say so by
+// checking for its presence.
+//
+// Verification works on a copy and never mutates req.
+func VerifyRequest(req, secret []byte) error {
+	if len(req) < HeaderLen {
+		return ErrShortPacket
+	}
+	length := int(binary.BigEndian.Uint16(req[2:4]))
+	if length < HeaderLen || length > MaxPacketLen || len(req) < length {
+		return ErrBadLength
+	}
+
+	buf := make([]byte, length)
+	copy(buf, req[:length])
+
+	derived := !Code(buf[0]).randomAuthenticator()
+
+	var received [AuthenticatorLen]byte
+	copy(received[:], buf[4:HeaderLen])
+	if derived {
+		// The sender computed both digests over a packet whose authenticator
+		// field read as zero, so reproduce that before checking either.
+		copy(buf[4:HeaderLen], zeros[:])
+	}
+
+	for i := HeaderLen; i < length; {
+		if i+2 > length {
+			return ErrBadAttribute
+		}
+		alen := int(buf[i+1])
+		if alen < 2 || i+alen > length {
+			return ErrBadAttribute
+		}
+		if AttrType(buf[i]) == AttrMessageAuthenticator {
+			if alen != messageAuthenticatorLen {
+				return ErrBadMessageAuth
+			}
+			var got [AuthenticatorLen]byte
+			copy(got[:], buf[i+2:i+alen])
+			copy(buf[i+2:i+alen], zeros[:])
+
+			mac := hmac.New(md5.New, secret)
+			mac.Write(buf)
+			if !hmac.Equal(got[:], mac.Sum(nil)) {
+				return ErrBadMessageAuth
+			}
+			// Restore it; the authenticator digest below covers the packet
+			// with the completed Message-Authenticator in place.
+			copy(buf[i+2:i+alen], got[:])
+		}
+		i += alen
+	}
+
+	if !derived {
+		return nil
 	}
 
 	h := md5.New()

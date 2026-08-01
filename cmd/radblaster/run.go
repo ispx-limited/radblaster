@@ -51,6 +51,8 @@ func runLoad(args []string) error {
 		calling   = fs.String("calling-station-id", "", "Calling-Station-Id template; {n} is the session number")
 		portType  = fs.Uint("nas-port-type", 0, "NAS-Port-Type value, for example 15 for Ethernet")
 
+		coaListen = fs.String("coa-listen", "", "address to accept CoA and Disconnect on, for example :3799")
+
 		seed = fs.Uint64("seed", 0, "seed for a reproducible run; 0 draws a fresh one")
 	)
 	fs.Usage = func() {
@@ -120,6 +122,7 @@ func runLoad(args []string) error {
 		NASPortType:      uint32(*portType),
 		CallingStationID: *calling,
 		NASPortID:        *nasPortID,
+		CoAListen:        *coaListen,
 		Seed:             *seed,
 	}
 
@@ -172,6 +175,26 @@ func report(w io.Writer, res *engine.Result) {
 	}
 	fmt.Fprintf(tw, "  Setup rate achieved\t%.0f/s\n", res.AchievedRate)
 	_ = tw.Flush()
+
+	if d := res.DynAuth; d.Total() > 0 {
+		fmt.Fprintln(w)
+		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(tw, "Server-initiated\tReceived\tAcknowledged\tRefused\n")
+		if d.DisconnectRequests > 0 {
+			fmt.Fprintf(tw, "  Disconnect-Request\t%d\t%d\t%d\n",
+				d.DisconnectRequests, d.DisconnectACKs, d.DisconnectNAKs)
+		}
+		if d.CoARequests > 0 {
+			fmt.Fprintf(tw, "  CoA-Request\t%d\t%d\t%d\n", d.CoARequests, d.CoAACKs, d.CoANAKs)
+		}
+		if d.Unverified > 0 {
+			fmt.Fprintf(tw, "  Failed verification\t%d\t-\t-\n", d.Unverified)
+		}
+		if d.Malformed > 0 {
+			fmt.Fprintf(tw, "  Malformed\t%d\t-\t-\n", d.Malformed)
+		}
+		_ = tw.Flush()
+	}
 
 	// Latency detail for authentication, which is the exchange most runs are
 	// really asking about.
@@ -253,6 +276,18 @@ func warn(w io.Writer, res *engine.Result) {
 				"%d %s replies failed verification, which almost always means the shared secret is wrong.",
 				e.Unverified, e.Name))
 		}
+	}
+
+	if d := res.DynAuth; d.DisconnectNAKs+d.CoANAKs > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d server-initiated requests were refused because the session they named was no longer "+
+				"online. For a bulk change that is the figure that matters: those subscribers did not "+
+				"receive it.", d.DisconnectNAKs+d.CoANAKs))
+	}
+	if res.DynAuth.Unverified > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d server-initiated requests failed verification and were dropped without a reply, "+
+				"which means they were signed with a different shared secret.", res.DynAuth.Unverified))
 	}
 
 	if res.OfferedRate > 0 && res.AchievedRate < res.OfferedRate*0.95 {

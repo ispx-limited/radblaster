@@ -74,6 +74,11 @@ type Config struct {
 	NASPortID        string
 	TerminateCause   uint32
 
+	// CoAListen is the address to accept CoA-Request and Disconnect-Request
+	// on, for example ":3799". Empty means the run does not present itself as
+	// an access node the server can push changes to.
+	CoAListen string
+
 	// Seed makes a run reproducible. Zero draws a fresh seed.
 	Seed uint64
 }
@@ -105,7 +110,7 @@ func (c *Config) terminateCause() uint32 {
 	if c.TerminateCause > 0 {
 		return c.TerminateCause
 	}
-	return 1 // User-Request
+	return causeUserRequest
 }
 
 func (c *Config) validate() error {
@@ -214,6 +219,9 @@ type Result struct {
 	OfferedRate  float64
 	AchievedRate float64
 	SetupWindow  time.Duration
+
+	// DynAuth counts the server-initiated requests this run answered.
+	DynAuth DynAuth
 }
 
 // Access returns the authentication metrics, which every run produces.
@@ -242,13 +250,27 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	runID := uint32(seed)
 
+	reg := newRegistry()
+
+	// The dynamic authorisation listener makes this behave like an access node
+	// the server can push changes to, which is the only way to test whether a
+	// bulk policy change or a mass disconnect actually lands.
+	var da *dynauth
+	if cfg.CoAListen != "" {
+		var err error
+		if da, err = newDynAuth(cfg.CoAListen, cfg.Secret, reg); err != nil {
+			return nil, err
+		}
+		defer da.close()
+	}
+
 	n := cfg.links()
 	shards := make([]*shard, 0, n)
 	for i := 0; i < n; i++ {
 		// Each shard derives its own stream from the run seed, so the run is
 		// reproducible without the shards having to coordinate.
 		r := rand.New(rand.NewPCG(seed, uint64(i)))
-		s, err := newShard(&cfg, i, n, runID, r)
+		s, err := newShard(&cfg, i, n, runID, r, reg)
 		if err != nil {
 			for _, done := range shards {
 				done.close()
@@ -277,6 +299,16 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 
 	started := time.Now()
 
+	var daWG sync.WaitGroup
+	if da != nil {
+		da.shards = shards
+		daWG.Add(1)
+		go func() {
+			defer daWG.Done()
+			da.serve(runCtx)
+		}()
+	}
+
 	var wg sync.WaitGroup
 	for _, s := range shards {
 		wg.Add(1)
@@ -286,6 +318,13 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		}(s)
 	}
 	wg.Wait()
+
+	if da != nil {
+		// Close first so the listener's pending read returns immediately
+		// rather than waiting out its deadline.
+		da.close()
+		daWG.Wait()
+	}
 
 	elapsed := time.Since(started)
 
@@ -315,6 +354,10 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	// established in. Dividing by the whole run would understate it whenever
 	// sessions are held online afterwards, because most of that time is spent
 	// deliberately not setting anything up.
+	if da != nil {
+		res.DynAuth = da.snapshot()
+	}
+
 	res.SetupWindow = setupEnd.Sub(started)
 	if res.SetupWindow > 0 {
 		res.AchievedRate = float64(res.Access().Sent) / res.SetupWindow.Seconds()

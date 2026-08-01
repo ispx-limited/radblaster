@@ -58,6 +58,10 @@ type session struct {
 
 	state  sessionState
 	nextAt time.Time
+	// queueIdx is this session's position in its shard's due queue, or -1
+	// when it is not queued. Tracking it lets a disconnect remove the
+	// session directly instead of searching for it.
+	queueIdx int
 
 	username      string
 	acctSessionID string
@@ -85,6 +89,7 @@ func newSession(index uint32, seq uint64, cfg *Config, runID uint32) *session {
 		index:    index,
 		seq:      seq,
 		state:    stateNew,
+		queueIdx: -1,
 		username: expandUsername(cfg.Username, seq),
 		// Unique per run and stable for the life of the session, which is
 		// what a server keys its session table on.
@@ -128,7 +133,7 @@ func (s *session) buildAccess(p *radius.Packet, cfg *Config, rng interface{ Uint
 }
 
 // buildAcct fills in an Accounting-Request of the given status type.
-func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now time.Time) {
+func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now time.Time, cause uint32) {
 	p.AddString(radius.AttrUserName, s.username)
 	p.AddString(radius.AttrAcctSessionID, s.acctSessionID)
 	p.AddUint32(radius.AttrAcctStatusType, status)
@@ -169,7 +174,10 @@ func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now ti
 	p.AddUint32(radius.AttrAcctOutputPackets, uint32(out/1400))
 
 	if status == acctStop {
-		p.AddUint32(radius.AttrAcctTerminateCause, cfg.terminateCause())
+		if cause == 0 {
+			cause = cfg.terminateCause()
+		}
+		p.AddUint32(radius.AttrAcctTerminateCause, cause)
 	}
 }
 
@@ -225,4 +233,10 @@ const (
 	acctStart   = 1
 	acctStop    = 2
 	acctInterim = 3
+)
+
+// Terminate causes from RFC 2866 section 5.10.
+const (
+	causeUserRequest = 1
+	causeAdminReset  = 6
 )
