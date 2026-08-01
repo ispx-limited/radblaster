@@ -10,18 +10,26 @@ import (
 // radblaster where to find what is already on the machine.
 //
 // Discovery only makes names resolvable; it never changes what goes on the
-// wire, because an attribute is addressable by number regardless. What was
-// found is always reported, and saving a profile pins the paths explicitly, so
-// a run that has to be repeatable does not depend on what happens to be
-// installed on the host that ran it.
+// wire. A dictionary is a local convenience that maps names to numbers, and
+// the names themselves are never exchanged between a server and its clients,
+// so an attribute is addressable by number whatever is loaded. What was found
+// is always reported, and saving a profile pins the paths explicitly, so a run
+// that has to be repeatable does not depend on what happens to be installed on
+// the host that ran it.
+// The order matters and is not alphabetical. The shared files come first and
+// the configuration directory last, because a later definition replaces an
+// earlier one: an operator's own attributes live in the configuration
+// directory and should win over the shipped set, which is not meant to be
+// edited. The /usr/local variants are where a build from source installs by
+// default, and the plain /usr ones where a package does.
 var wellKnownDictionaries = []string{
 	"/usr/share/freeradius/dictionary",
 	"/usr/local/share/freeradius/dictionary",
 	"/usr/share/radius/dictionary",
 	"/usr/local/share/radius/dictionary",
+	"/opt/homebrew/share/freeradius/dictionary",
 	"/etc/raddb/dictionary",
 	"/usr/local/etc/raddb/dictionary",
-	"/opt/homebrew/share/freeradius/dictionary",
 }
 
 // searchPaths is the list discovery walks. It is a variable so a test can

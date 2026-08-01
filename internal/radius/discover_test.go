@@ -254,3 +254,74 @@ func TestDiscoverSkipsADirectoryWithNoRadiusSubtree(t *testing.T) {
 		t.Errorf("found %v, want none", found)
 	}
 }
+
+// TestLocalAttributesWinOverShipped pins the discovery order. An operator's
+// own definitions live in the configuration directory and must replace the
+// shipped ones, which are not meant to be edited. The order is not
+// alphabetical and would be easy to tidy into being wrong.
+func TestLocalAttributesWinOverShipped(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	local := filepath.Join(root, "local")
+	for _, d := range []string{shared, local} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	sharedFile := filepath.Join(shared, "dictionary")
+	localFile := filepath.Join(local, "dictionary")
+	if err := os.WriteFile(sharedFile, []byte("ATTRIBUTE Site-Tag 200 string\n"), 0o644); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+	// The same number, renamed locally, plus one the shipped set lacks.
+	if err := os.WriteFile(localFile, []byte("ATTRIBUTE Site-Tag-Local 200 string\nATTRIBUTE Extra-Tag 201 string\n"), 0o644); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+
+	old := searchPaths
+	searchPaths = []string{sharedFile, localFile}
+	t.Cleanup(func() { searchPaths = old })
+
+	d, paths, err := LoadDiscovered()
+	if err != nil {
+		t.Fatalf("LoadDiscovered: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("paths = %v, want both", paths)
+	}
+	if def := d.ByNumber(200); def == nil || def.Name != "Site-Tag-Local" {
+		t.Errorf("attribute 200 = %v, want the local definition to win", def)
+	}
+	if d.ByName("Extra-Tag") == nil {
+		t.Error("a locally added attribute was not loaded")
+	}
+}
+
+// TestLoadedAttributesAreFindableByNumber guards the path a decoder takes.
+// An attribute registered only by name would be invisible when a reply came
+// back carrying it, and its declared type would be lost.
+func TestLoadedAttributesAreFindableByNumber(t *testing.T) {
+	d := loadTestDict(t)
+
+	def := d.ByNumber(200)
+	if def == nil {
+		t.Fatal("Site-Local-Tag was not registered by number")
+	}
+	if def.Name != "Site-Local-Tag" {
+		t.Errorf("attribute 200 = %q, want Site-Local-Tag", def.Name)
+	}
+	if got := d.FormatValue(200, []byte("abc")); got != `"abc"` {
+		t.Errorf("value formatted as %s, want the declared string type to be used", got)
+	}
+}
+
+// TestLoadingDoesNotReachIntoTheSharedDictionary keeps one loaded set from
+// changing what another sees.
+func TestLoadingDoesNotReachIntoTheSharedDictionary(t *testing.T) {
+	loadTestDict(t)
+
+	if StandardDictionary().ByNumber(200) != nil {
+		t.Error("a loaded attribute leaked into the shared standard set by number")
+	}
+}

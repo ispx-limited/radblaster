@@ -23,6 +23,8 @@ func (d *Dictionary) Clone() *Dictionary {
 		byVendor:   make(map[uint32]map[AttrType]*AttrDef, len(d.byVendor)),
 		vendorName: make(map[uint32]string, len(d.vendorName)),
 	}
+	// An array, so this copies rather than aliases: loading into the clone
+	// must not reach back into the shared standard dictionary.
 	out.byNumber = d.byNumber
 	for k, v := range d.byName {
 		out.byName[k] = v
@@ -282,6 +284,10 @@ func (d *Dictionary) addAttr(def *AttrDef) {
 	if def.Vendor == 0 {
 		def.Qualified = def.Name
 		d.byName[strings.ToLower(def.Name)] = def
+		// Also by number, or a loaded attribute would be findable by name but
+		// invisible to anything decoding a packet, and its declared type would
+		// be lost when a value came to be formatted.
+		d.byNumber[def.Type] = def
 		return
 	}
 
