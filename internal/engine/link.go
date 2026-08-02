@@ -69,6 +69,15 @@ func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
 		return nil, fmt.Errorf("engine: opening socket to %s: %w", server, err)
 	}
 
+	// A link's replies arrive in bursts while its goroutine is busy with the
+	// one before, and the default socket buffer is small enough that a run at
+	// rate overflows it. A dropped reply is counted as a timeout, so the tool
+	// would be reporting its own loss as the server's. Best effort: the kernel
+	// clamps this to net.core.rmem_max, and a smaller buffer is still a working
+	// run rather than a failure to start.
+	_ = conn.SetReadBuffer(linkBufferBytes)
+	_ = conn.SetWriteBuffer(linkBufferBytes)
+
 	l := &link{
 		conn: conn,
 		enc:  radius.NewEncoder(secret),
@@ -79,6 +88,12 @@ func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
 	l.build.init()
 	return l, nil
 }
+
+// linkBufferBytes is the socket buffer asked for on each link, in each
+// direction. Large enough to absorb a burst of replies without dropping any,
+// small enough that a run with hundreds of links does not ask the kernel for an
+// unreasonable amount of memory.
+const linkBufferBytes = 512 << 10
 
 // builderArena is how much attribute value storage one request is built in.
 // Comfortably more than a subscriber's worth of attributes, so the arena is
