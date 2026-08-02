@@ -9,15 +9,23 @@ Download a build for Linux or macOS from the
 the latest directly:
 
 ```sh
-curl -fsSL https://github.com/ispx-limited/radblaster/releases/latest/download/radblaster_linux_amd64.tar.gz | tar xz
+base=https://github.com/ispx-limited/radblaster/releases/latest/download
+curl -fsSLO "$base/radblaster_linux_amd64.tar.gz"
+curl -fsSLO "$base/checksums.txt"
+sha256sum --ignore-missing -c checksums.txt
+tar xzf radblaster_linux_amd64.tar.gz
 cd radblaster_linux_amd64
 ./radblaster version
 ```
 
+The checksum is verified before anything is unpacked, so a download that did
+not arrive intact stops there. `--ignore-missing` is what lets one archive be
+checked against a `checksums.txt` that covers all of them. On macOS the command
+is `shasum -a 256 --ignore-missing -c checksums.txt`.
+
 Replace `linux_amd64` with `linux_arm64`, `darwin_amd64` or `darwin_arm64` as
 needed. There is no Windows build. The archive holds a single binary with the
-web interface built in, and `checksums.txt` on the release verifies the
-download.
+web interface built in, so nothing else needs installing.
 
 ## Something to point it at
 

@@ -84,18 +84,26 @@ Download a build for Linux or macOS from the
 latest directly:
 
 ```sh
-curl -fsSL https://github.com/ispx-limited/radblaster/releases/latest/download/radblaster_linux_amd64.tar.gz | tar xz
+base=https://github.com/ispx-limited/radblaster/releases/latest/download
+curl -fsSLO "$base/radblaster_linux_amd64.tar.gz"
+curl -fsSLO "$base/checksums.txt"
+sha256sum --ignore-missing -c checksums.txt
+tar xzf radblaster_linux_amd64.tar.gz
 ./radblaster_linux_amd64/radblaster version
 ```
 
+The checksum is verified before anything is unpacked, so a download that did
+not arrive intact stops there. `--ignore-missing` is what lets one archive be
+checked against a `checksums.txt` that covers all of them. On macOS the command
+is `shasum -a 256 --ignore-missing -c checksums.txt`.
+
 Replace `linux_amd64` with `linux_arm64`, `darwin_amd64` or `darwin_arm64` as
 needed. There is no Windows build. Each archive holds a single binary with the
-web interface built in, so nothing else needs installing, and `checksums.txt` on
-the release verifies the download.
+web interface built in, so nothing else needs installing.
 
 ## Building
 
-Requires Go 1.24 or later.
+Requires Go 1.25 or later.
 
 ```sh
 make build      # builds bin/radblaster
@@ -128,6 +136,14 @@ server it can reach and has no authentication of its own, so putting it on a
 shared address hands that ability to anyone who can reach it. The shared secret
 is accepted but never returned, so a browser pointed at a running instance
 cannot read it back.
+
+Loopback keeps the network out, but on its own it does not keep a browser out:
+any page an operator visits can send requests to 127.0.0.1, and a name an
+attacker controls can be pointed there so the browser treats their page as
+same-origin. So the API also refuses anything cross-origin, requires
+`application/json` on a request carrying a body, and answers only to an address
+or to `localhost` rather than to a name. Behind a reverse proxy that addresses
+it by name, pass `-allowed-host` to name it.
 
 ### Subscriber sessions
 

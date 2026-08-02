@@ -71,3 +71,30 @@ That makes the interface scriptable. Driving a run from CI through `POST
 
 The shared secret is accepted but never returned by the API, so a browser
 pointed at a running instance cannot read it back out.
+
+### Why loopback is not on its own enough
+
+Binding to loopback keeps the network out. It does not keep a browser out: a
+page on any site an operator visits can send requests to `127.0.0.1`, and a
+name an attacker controls can be pointed at loopback so that the browser treats
+their page as same-origin with the interface. Left open, that is enough for a
+site to start a run against a production AAA platform from the operator's own
+machine, without ever reading a reply.
+
+So the API also:
+
+- refuses any request whose `Origin` is not its own
+- requires `application/json` on a request carrying a body, which is what makes
+  a browser ask permission before sending one at all
+- answers only to an address or to `localhost`, never to a name, because a name
+  is the thing that can be repointed
+
+Behind a reverse proxy that addresses it by name, name it with `-allowed-host`:
+
+```sh
+radblaster serve -addr 127.0.0.1:8080 -allowed-host radblaster.internal
+```
+
+None of this is authentication. It stops a browser being used as the way in; it
+does not stop anyone who can reach the port directly. The warning above still
+holds.
