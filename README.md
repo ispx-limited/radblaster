@@ -146,6 +146,15 @@ wide, so a single source port can only carry 256 requests at a time; `-links`
 sets how many ports to open per endpoint. If a run is limited by this rather
 than by the server, it says so and tells you the ceiling it hit.
 
+The default is two links per core, capped at 64, which is chosen for a server
+that answers rather than for the highest number a generator can reach. A link
+spends most of its time waiting for a reply, so raising `-links` well past the
+default still buys throughput when the thing under test can take it: on a 24
+thread desktop, going from the default to 256 links lifts authentication from
+about 2.1 to 2.5 million requests per second. Each link costs two sockets'
+worth of buffers, which is the reason for the cap rather than a limit of the
+protocol.
+
 A request that goes unanswered is repeated, as a real access node would, and
 the wait doubles after each attempt. `-retries 0` turns that off when you want
 to measure raw loss on the path rather than simulate a node. Either way the
