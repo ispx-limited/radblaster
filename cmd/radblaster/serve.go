@@ -23,8 +23,10 @@ func runServe(args []string) error {
 		profiles = fs.String("profiles", "profiles", "directory to keep saved profiles in")
 		noAuto   = fs.Bool("no-auto-dictionary", false, "do not look for dictionaries in the usual system locations")
 		dicts    stringList
+		hosts    stringList
 	)
 	fs.Var(&dicts, "dictionary", "dictionary file or directory to load; repeatable")
+	fs.Var(&hosts, "allowed-host", "hostname this instance may be addressed by, for use behind a proxy; repeatable")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Serve the web interface.\n\nFlags:")
 		fs.PrintDefaults()
@@ -48,6 +50,9 @@ func runServe(args []string) error {
 
 	srv := api.New(dict, web.FS(), store)
 	srv.SetDictionaryPaths(dictPaths)
+	for _, h := range hosts {
+		srv.AllowHost(h)
+	}
 	defer srv.Close()
 
 	httpSrv := &http.Server{

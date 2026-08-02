@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,10 @@ type Server struct {
 	ui        fs.FS
 	profiles  *profile.Store
 
+	// allowedHosts are the extra names this instance answers to, beyond an
+	// address literal and localhost. See checkHost.
+	allowedHosts map[string]bool
+
 	mu      sync.Mutex
 	state   State
 	cfg     RunConfig
@@ -63,11 +68,22 @@ func New(dict *radius.Dictionary, ui fs.FS, profiles *profile.Store) *Server {
 		dict = radius.StandardDictionary()
 	}
 	return &Server{
-		dict:     dict,
-		ui:       ui,
-		profiles: profiles,
-		state:    StateIdle,
-		watchers: make(map[chan Status]struct{}),
+		dict:         dict,
+		ui:           ui,
+		profiles:     profiles,
+		state:        StateIdle,
+		watchers:     make(map[chan Status]struct{}),
+		allowedHosts: make(map[string]bool),
+	}
+}
+
+// AllowHost adds a name this instance will answer to. Only needed when
+// something in front of it, such as a reverse proxy, addresses it by name
+// rather than by address; see checkHost for why a name is not accepted
+// otherwise.
+func (s *Server) AllowHost(host string) {
+	if host = strings.ToLower(strings.TrimSpace(host)); host != "" {
+		s.allowedHosts[host] = true
 	}
 }
 
@@ -92,7 +108,7 @@ func (s *Server) Handler() http.Handler {
 	if s.ui != nil {
 		mux.Handle("/", http.FileServer(http.FS(s.ui)))
 	}
-	return mux
+	return guard(mux, s.allowedHosts)
 }
 
 // Close stops any run still going and releases its sockets.
