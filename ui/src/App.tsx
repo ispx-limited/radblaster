@@ -93,9 +93,20 @@ export default function App() {
   return (
     <div className="min-h-screen bg-background">
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-5 py-3 backdrop-blur">
-        <div className="size-5 rounded-md bg-gradient-to-br from-[#e53935] to-[#9b1c1c]" />
-        <h1 className="text-sm font-bold tracking-tight">radblaster</h1>
-        <span className="text-xs text-muted-foreground/70">RADIUS load testing</span>
+        {/* 32px is the smallest the mark may be drawn at. The stacked wordmark
+            beside it comes to the same height, which is what keeps the two
+            lines sharing an edge rather than each centring on its own box. */}
+        <img
+          src="ispx-icon.png"
+          alt="ispx"
+          width={32}
+          height={32}
+          className="size-8 shrink-0"
+        />
+        <div className="flex flex-col leading-tight">
+          <h1 className="text-sm font-bold tracking-tight">radblaster</h1>
+          <span className="text-xs text-muted-foreground/70">RADIUS load testing</span>
+        </div>
         <div className="flex-1" />
         {status.state !== "idle" ? (
           <span className="text-xs tabular-nums text-muted-foreground">{elapsed(status.elapsedMs)}</span>
