@@ -5,6 +5,7 @@ linters:
   enable:
     - bodyclose
     - errorlint
+    - gosec
     - misspell
     - revive
     - unconvert
@@ -26,9 +27,34 @@ linters:
 
   exclusions:
     rules:
-      # MD5 is not a choice here; the protocol specifies it.
-      - path: internal/radius/
-        text: "weak cryptographic primitive"
+      # MD5 is not a choice here; RADIUS specifies it. That is true of the
+      # codec and of every test that has to build a packet a server would.
+      - text: "weak cryptographic primitive|G501|G401"
+        linters: [gosec]
+
+      # RADIUS field widths are fixed by the protocol: an attribute length is
+      # one octet, a packet length two. Every narrowing here is guarded by the
+      # bound the protocol sets, immediately above it, and the encoder refuses
+      # a value that would not fit rather than truncating it.
+      - text: "G115"
+        linters: [gosec]
+
+      # Not every random number is a secret. Request Authenticators come from
+      # crypto/rand through radius.Rand; math/rand/v2 is used only for the
+      # things a run must be able to reproduce from a seed, such as identifier
+      # ordering and per-session jitter.
+      - text: "G404"
+        linters: [gosec]
+
+      # Reading a file the operator named is the feature: dictionaries and
+      # profiles are paths they pass in. Profile names are validated against an
+      # allowlist before they reach the filesystem; see profile.validName.
+      - text: "G304"
+        linters: [gosec]
+
+      # Test fixtures are not deployments.
+      - path: _test\.go
+        linters: [gosec]
 
 formatters:
   enable:

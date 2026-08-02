@@ -27,7 +27,7 @@ make test     # go test ./...
 make build    # builds bin/radblaster with version metadata
 ```
 
-Go 1.24 or later and `golangci-lint` are the only prerequisites.
+Go 1.25 or later and `golangci-lint` are the only prerequisites.
 
 ## Commits and branches
 
