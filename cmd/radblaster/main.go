@@ -65,8 +65,10 @@ func run(args []string) error {
 func runAuth(args []string) error {
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
 	var (
-		server   = fs.String("server", "", "RADIUS server as host:port (required)")
-		secret   = fs.String("secret", "", "shared secret (required)")
+		server    = fs.String("server", "", "RADIUS server as host:port (required)")
+		secret    = fs.String("secret", "", "shared secret (required)")
+		allowNoMA = fs.Bool("allow-missing-message-authenticator", false,
+			"accept a reply that carries no Message-Authenticator, which CVE-2024-3596 makes forgeable")
 		user     = fs.String("user", "", "User-Name (required)")
 		password = fs.String("password", "", "password to authenticate with")
 		chap     = fs.Bool("chap", false, "authenticate with CHAP instead of PAP")
@@ -134,10 +136,11 @@ func runAuth(args []string) error {
 	defer stop()
 
 	c := &radius.Client{
-		Addr:    *server,
-		Secret:  []byte(*secret),
-		Timeout: *timeout,
-		Retries: *retries,
+		Addr:                             *server,
+		Secret:                           []byte(*secret),
+		Timeout:                          *timeout,
+		Retries:                          *retries,
+		AllowMissingMessageAuthenticator: *allowNoMA,
 	}
 
 	started := time.Now()

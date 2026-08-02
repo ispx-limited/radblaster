@@ -163,6 +163,13 @@ type Config struct {
 	// an access node the server can push changes to.
 	CoAListen string
 
+	// AllowMissingMessageAuthenticator accepts replies that carry no
+	// Message-Authenticator. Every Access-Request this sends carries one, so a
+	// correct server echoes one back, and a reply without one is verifiable
+	// only by an MD5 digest that CVE-2024-3596 shows can be forged on the path.
+	// Set this only to test a peer that deliberately omits it.
+	AllowMissingMessageAuthenticator bool
+
 	// Seed makes a run reproducible. Zero draws a fresh seed.
 	Seed uint64
 }

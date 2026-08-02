@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/json"
@@ -44,7 +45,24 @@ func echoServer(t *testing.T) string {
 			}
 			out := []byte{byte(code), buf[1], 0, 0}
 			out = append(out, buf[4:radius.HeaderLen]...)
+
+			// An Access-Accept answering a request that carried a
+			// Message-Authenticator carries one back, which the engine now
+			// insists on; see Verifier.RequireMessageAuthenticator.
+			msgAuthOff := -1
+			if code == radius.CodeAccessAccept {
+				out = append(out, byte(radius.AttrMessageAuthenticator), 18)
+				msgAuthOff = len(out)
+				out = append(out, make([]byte, radius.AuthenticatorLen)...)
+			}
 			binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
+
+			if msgAuthOff >= 0 {
+				mac := hmac.New(md5.New, []byte("testing123"))
+				mac.Write(out)
+				copy(out[msgAuthOff:msgAuthOff+radius.AuthenticatorLen], mac.Sum(nil))
+			}
+
 			h := md5.New()
 			h.Write(out)
 			h.Write([]byte("testing123"))

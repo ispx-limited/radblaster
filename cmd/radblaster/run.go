@@ -61,6 +61,8 @@ func runLoad(args []string) error {
 		portType  = fs.Uint("nas-port-type", 0, "NAS-Port-Type value, for example 15 for Ethernet")
 
 		coaListen = fs.String("coa-listen", "", "address to accept CoA and Disconnect on, for example :3799")
+		allowNoMA = fs.Bool("allow-missing-message-authenticator", false,
+			"accept replies that carry no Message-Authenticator, which CVE-2024-3596 makes forgeable")
 
 		dicts stringList
 		attrs stringList
@@ -210,6 +212,8 @@ func runLoad(args []string) error {
 		Attributes:       specs,
 		CoAListen:        *coaListen,
 		Seed:             *seed,
+
+		AllowMissingMessageAuthenticator: *allowNoMA,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

@@ -74,7 +74,11 @@ type RunConfig struct {
 	Attributes   []profile.Attr `json:"attributes,omitempty"`
 	Dictionaries []string       `json:"dictionaries,omitempty"`
 	CoAListen    string         `json:"coaListen,omitempty"`
-	Seed         uint64         `json:"seed,omitempty"`
+	// AllowMissingMessageAuthenticator accepts replies that carry no
+	// Message-Authenticator. See engine.Config for why that is refused by
+	// default.
+	AllowMissingMessageAuthenticator bool   `json:"allowMissingMessageAuthenticator,omitempty"`
+	Seed                             uint64 `json:"seed,omitempty"`
 }
 
 // redacted returns a copy safe to hand back to a client.
@@ -118,6 +122,7 @@ func (c RunConfig) toEngine(dict *radius.Dictionary) (engine.Config, error) {
 	cfg.NASPortID = c.NASPortID
 	cfg.CoAListen = c.CoAListen
 	cfg.Seed = c.Seed
+	cfg.AllowMissingMessageAuthenticator = c.AllowMissingMessageAuthenticator
 
 	cfg.Username = c.Username
 	if cfg.Username == "" {

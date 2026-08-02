@@ -2,6 +2,7 @@ package radius
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
@@ -25,6 +26,9 @@ type responder struct {
 	identifierOverride int
 	// silent drops every request.
 	silent bool
+	// omitMessageAuth answers without a Message-Authenticator, as a server
+	// predating the CVE-2024-3596 guidance does.
+	omitMessageAuth bool
 
 	received atomic.Int32
 }
@@ -79,7 +83,22 @@ func (r *responder) serve() {
 		reply := []byte{byte(CodeAccessAccept), id, 0, 0}
 		reply = append(reply, reqAuth[:]...)
 		reply = append(reply, byte(AttrFramedIPAddress), 6, 192, 0, 2, 10)
+
+		// A server that answers an Access-Request carrying a
+		// Message-Authenticator echoes one back, so that is the default here.
+		msgAuthOff := -1
+		if !r.omitMessageAuth {
+			reply = append(reply, byte(AttrMessageAuthenticator), messageAuthenticatorLen)
+			msgAuthOff = len(reply)
+			reply = append(reply, zeros[:]...)
+		}
 		binary.BigEndian.PutUint16(reply[2:4], uint16(len(reply)))
+
+		if msgAuthOff >= 0 {
+			mac := hmac.New(md5.New, r.replySecret)
+			mac.Write(reply)
+			copy(reply[msgAuthOff:msgAuthOff+AuthenticatorLen], mac.Sum(nil))
+		}
 		signReply(reply, r.replySecret)
 
 		_, _ = r.conn.WriteToUDP(reply, from)
@@ -207,4 +226,84 @@ func signReply(reply, secret []byte) {
 	h.Write(reply)
 	h.Write(secret)
 	copy(reply[4:HeaderLen], h.Sum(nil))
+}
+
+// A reply verifiable only by its MD5 Response Authenticator is what
+// CVE-2024-3596 forges, so one that carries no Message-Authenticator is
+// refused rather than quietly accepted.
+func TestClientRefusesReplyWithoutMessageAuthenticator(t *testing.T) {
+	r := newResponder(t, &responder{
+		replySecret:        testSecret,
+		identifierOverride: -1,
+		omitMessageAuth:    true,
+	})
+	c := &Client{Addr: r.addr(), Secret: testSecret, Timeout: 300 * time.Millisecond, Retries: 1}
+
+	p, err := New(CodeAccessRequest, 9)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.Exchange(context.Background(), p); !errors.Is(err, ErrNoMessageAuth) {
+		t.Fatalf("err = %v, want ErrNoMessageAuth", err)
+	}
+}
+
+// The refusal is a default, not a rule: testing a peer that omits it is a
+// legitimate thing to want.
+func TestClientCanAcceptReplyWithoutMessageAuthenticator(t *testing.T) {
+	r := newResponder(t, &responder{
+		replySecret:        testSecret,
+		identifierOverride: -1,
+		omitMessageAuth:    true,
+	})
+	c := &Client{
+		Addr: r.addr(), Secret: testSecret, Timeout: time.Second, Retries: 1,
+		AllowMissingMessageAuthenticator: true,
+	}
+
+	p, err := New(CodeAccessRequest, 10)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	reply, err := c.Exchange(context.Background(), p)
+	if err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if reply.Code != CodeAccessAccept {
+		t.Errorf("code = %v, want Access-Accept", reply.Code)
+	}
+}
+
+// A tampered Message-Authenticator must not pass, which is the property the
+// whole requirement rests on.
+func TestVerifierRejectsForgedMessageAuthenticator(t *testing.T) {
+	var reqAuth [AuthenticatorLen]byte
+	p, err := New(CodeAccessRequest, 3)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	reqAuth = p.Authenticator
+
+	reply := []byte{byte(CodeAccessAccept), 3, 0, 0}
+	reply = append(reply, reqAuth[:]...)
+	reply = append(reply, byte(AttrMessageAuthenticator), messageAuthenticatorLen)
+	off := len(reply)
+	reply = append(reply, zeros[:]...)
+	binary.BigEndian.PutUint16(reply[2:4], uint16(len(reply)))
+
+	mac := hmac.New(md5.New, testSecret)
+	mac.Write(reply)
+	copy(reply[off:off+AuthenticatorLen], mac.Sum(nil))
+	signReply(reply, testSecret)
+
+	v := NewVerifier(testSecret)
+	v.RequireMessageAuthenticator(true)
+	if err := v.Verify(reply, reqAuth); err != nil {
+		t.Fatalf("a correctly signed reply should verify: %v", err)
+	}
+
+	reply[off] ^= 0x01
+	if err := v.Verify(reply, reqAuth); !errors.Is(err, ErrBadMessageAuth) {
+		t.Fatalf("err = %v, want ErrBadMessageAuth", err)
+	}
 }

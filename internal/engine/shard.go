@@ -89,11 +89,15 @@ func newShard(cfg *Config, index, total int, runID uint32, r *rand.Rand, reg *re
 	}
 
 	var err error
-	if s.auth, err = newLink(cfg.Server, cfg.Secret, r); err != nil {
+	if s.auth, err = newLink(cfg.Server, cfg.Secret, r, !cfg.AllowMissingMessageAuthenticator); err != nil {
 		return nil, err
 	}
 	if cfg.accounting() {
-		if s.acct, err = newLink(cfg.AcctServer, cfg.Secret, r); err != nil {
+		// Only the authentication link insists on a Message-Authenticator.
+		// Accounting-Request does not carry one, so nothing requires an
+		// Accounting-Response to either, and demanding it would fail against
+		// every server rather than catching anything.
+		if s.acct, err = newLink(cfg.AcctServer, cfg.Secret, r, false); err != nil {
 			s.auth.close()
 			return nil, err
 		}

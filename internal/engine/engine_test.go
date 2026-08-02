@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
 	"net"
@@ -25,6 +26,9 @@ type testServer struct {
 	// replySecret signs replies. Setting it to anything else simulates a
 	// shared secret mismatch.
 	replySecret []byte
+	// omitMessageAuth answers without a Message-Authenticator, as a server
+	// predating the CVE-2024-3596 guidance does.
+	omitMessageAuth bool
 	// code is the reply code to send.
 	code radius.Code
 	// silent drops every request.
@@ -103,7 +107,25 @@ func (s *testServer) serve() {
 			out := []byte{byte(s.code), req[1], 0, 0}
 			out = append(out, reqAuth[:]...)
 			out = append(out, byte(radius.AttrFramedIPAddress), 6, 192, 0, 2, 10)
+
+			// Echo a Message-Authenticator, as a server answering a request
+			// that carried one does. Without it the reply rests on the MD5
+			// Response Authenticator alone, which is what CVE-2024-3596
+			// forges and what the engine now refuses.
+			msgAuthOff := -1
+			if !s.omitMessageAuth {
+				// Two octet header plus a sixteen octet digest.
+				out = append(out, byte(radius.AttrMessageAuthenticator), 18)
+				msgAuthOff = len(out)
+				out = append(out, make([]byte, radius.AuthenticatorLen)...)
+			}
 			binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
+
+			if msgAuthOff >= 0 {
+				mac := hmac.New(md5.New, s.replySecret)
+				mac.Write(out)
+				copy(out[msgAuthOff:msgAuthOff+radius.AuthenticatorLen], mac.Sum(nil))
+			}
 
 			h := md5.New()
 			h.Write(out)

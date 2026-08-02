@@ -59,7 +59,7 @@ type link struct {
 	reply radius.Packet
 }
 
-func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
+func newLink(server string, secret []byte, r *rand.Rand, requireMsgAuth bool) (*link, error) {
 	addr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
 		return nil, fmt.Errorf("engine: resolving %s: %w", server, err)
@@ -78,10 +78,13 @@ func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
 	_ = conn.SetReadBuffer(linkBufferBytes)
 	_ = conn.SetWriteBuffer(linkBufferBytes)
 
+	ver := radius.NewVerifier(secret)
+	ver.RequireMessageAuthenticator(requireMsgAuth)
+
 	l := &link{
 		conn: conn,
 		enc:  radius.NewEncoder(secret),
-		ver:  radius.NewVerifier(secret),
+		ver:  ver,
 		rnd:  radius.NewRand(),
 		ids:  radius.NewIDPool(r),
 	}

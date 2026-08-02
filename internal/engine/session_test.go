@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
 	"math/rand/v2"
@@ -82,13 +83,25 @@ func (s *acctServer) serve(conn *net.UDPConn, code radius.Code) {
 
 		out := []byte{byte(code), req[1], 0, 0}
 		out = append(out, reqAuth[:]...)
+		msgAuthOff := -1
 		if code == radius.CodeAccessAccept {
 			for _, a := range s.acceptAttrs {
 				out = append(out, byte(a.Type), byte(len(a.Value)+2))
 				out = append(out, a.Value...)
 			}
+			// Answer as a server that received a Message-Authenticator does,
+			// which every Access-Request from here carries.
+			out = append(out, byte(radius.AttrMessageAuthenticator), 18)
+			msgAuthOff = len(out)
+			out = append(out, make([]byte, radius.AuthenticatorLen)...)
 		}
 		binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
+
+		if msgAuthOff >= 0 {
+			mac := hmac.New(md5.New, testSecret)
+			mac.Write(out)
+			copy(out[msgAuthOff:msgAuthOff+radius.AuthenticatorLen], mac.Sum(nil))
+		}
 
 		h := md5.New()
 		h.Write(out)

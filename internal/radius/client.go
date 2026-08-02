@@ -33,6 +33,10 @@ type Client struct {
 	// Retries is the number of additional attempts after the first. Zero
 	// means two, giving three attempts in total.
 	Retries int
+	// AllowMissingMessageAuthenticator accepts a reply that carries no
+	// Message-Authenticator. See Verifier.RequireMessageAuthenticator for why
+	// that is worth refusing by default.
+	AllowMissingMessageAuthenticator bool
 }
 
 func (c *Client) timeout() time.Duration {
@@ -73,6 +77,11 @@ func (c *Client) Exchange(ctx context.Context, p *Packet) (*Packet, error) {
 	buf := make([]byte, MaxPacketLen)
 	unverified := 0
 
+	unsigned := 0
+
+	ver := NewVerifier(c.Secret)
+	ver.RequireMessageAuthenticator(!c.AllowMissingMessageAuthenticator)
+
 	for attempt := 0; attempt <= c.retries(); attempt++ {
 		if _, err := conn.Write(wire); err != nil {
 			return nil, fmt.Errorf("radius: sending to %s: %w", c.Addr, err)
@@ -100,11 +109,14 @@ func (c *Client) Exchange(ctx context.Context, p *Packet) (*Packet, error) {
 			if n < HeaderLen || reply[1] != p.Identifier {
 				continue // not ours
 			}
-			if err := Verify(reply, p.Authenticator, c.Secret); err != nil {
+			if err := ver.Verify(reply, p.Authenticator); err != nil {
 				// Forged, corrupt, or signed with a different secret. Keep
 				// waiting rather than failing, so an injected packet cannot
 				// end a legitimate exchange, but remember that it happened.
 				unverified++
+				if errors.Is(err, ErrNoMessageAuth) {
+					unsigned++
+				}
 				continue
 			}
 			return Decode(reply)
@@ -115,6 +127,14 @@ func (c *Client) Exchange(ctx context.Context, p *Packet) (*Packet, error) {
 		}
 	}
 
+	// A reply that was well signed but carried no Message-Authenticator is a
+	// different problem from a wrong secret, and saying so saves an operator
+	// checking a secret that was right all along.
+	if unsigned > 0 && unsigned == unverified {
+		return nil, fmt.Errorf("%w: the server answered but did not sign its reply with one, "+
+			"which leaves the exchange open to CVE-2024-3596. Pass "+
+			"-allow-missing-message-authenticator to accept it anyway", ErrNoMessageAuth)
+	}
 	if unverified > 0 {
 		return nil, fmt.Errorf("%w (%d discarded)", ErrUnverifiedReply, unverified)
 	}

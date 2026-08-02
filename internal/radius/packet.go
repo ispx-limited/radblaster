@@ -40,6 +40,7 @@ var (
 	ErrUnsignedCode   = errors.New("radius: cannot sign this packet code")
 	ErrBadAuth        = errors.New("radius: response authenticator mismatch")
 	ErrBadMessageAuth = errors.New("radius: message authenticator mismatch")
+	ErrNoMessageAuth  = errors.New("radius: reply carries no Message-Authenticator")
 )
 
 // Attribute is a single type-length-value triple.
@@ -419,6 +420,8 @@ type Verifier struct {
 	digest hash.Hash
 	buf    []byte
 	sum    []byte
+
+	requireMsgAuth bool
 }
 
 // NewVerifier returns a Verifier for secret.
@@ -432,6 +435,21 @@ func NewVerifier(secret []byte) *Verifier {
 		sum:    make([]byte, 0, AuthenticatorLen),
 	}
 }
+
+// RequireMessageAuthenticator makes Verify reject a reply that carries no
+// Message-Authenticator at all.
+//
+// The Response Authenticator is an unkeyed MD5 digest, and MD5 has practical
+// chosen-prefix collisions, so an attacker on the path between here and the
+// server can turn one reply into another without knowing the secret: this is
+// CVE-2024-3596. The Message-Authenticator is an HMAC and is not forgeable that
+// way, which is why the fix is to insist on it rather than merely to check it
+// when it happens to be there. Every Access-Request this package sends carries
+// one, so a server that answers correctly will echo one back.
+//
+// Turning this off is for deliberately testing a peer that omits it. It is not
+// something to do to make a run succeed.
+func (v *Verifier) RequireMessageAuthenticator(require bool) { v.requireMsgAuth = require }
 
 // Verify checks a received reply against the request that produced it.
 //
@@ -457,8 +475,12 @@ func (v *Verifier) Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte)
 	copy(received[:], buf[4:HeaderLen])
 	copy(buf[4:HeaderLen], reqAuthenticator[:])
 
-	if err := v.checkMessageAuthenticator(buf, length); err != nil {
+	found, err := v.checkMessageAuthenticator(buf, length)
+	if err != nil {
 		return err
+	}
+	if v.requireMsgAuth && !found {
+		return ErrNoMessageAuth
 	}
 
 	v.digest.Reset()
@@ -486,20 +508,22 @@ func (v *Verifier) scratch(pkt []byte) ([]byte, int, error) {
 }
 
 // checkMessageAuthenticator verifies the digest in place, if the packet carries
-// one, and leaves buf as it found it.
-func (v *Verifier) checkMessageAuthenticator(buf []byte, length int) error {
+// one, and leaves buf as it found it. It reports whether one was present.
+func (v *Verifier) checkMessageAuthenticator(buf []byte, length int) (bool, error) {
+	found := false
 	for i := HeaderLen; i < length; {
 		if i+2 > length {
-			return ErrBadAttribute
+			return found, ErrBadAttribute
 		}
 		alen := int(buf[i+1])
 		if alen < 2 || i+alen > length {
-			return ErrBadAttribute
+			return found, ErrBadAttribute
 		}
 		if AttrType(buf[i]) == AttrMessageAuthenticator {
 			if alen != messageAuthenticatorLen {
-				return ErrBadMessageAuth
+				return found, ErrBadMessageAuth
 			}
+			found = true
 			var got [AuthenticatorLen]byte
 			copy(got[:], buf[i+2:i+alen])
 			copy(buf[i+2:i+alen], zeros[:])
@@ -508,7 +532,7 @@ func (v *Verifier) checkMessageAuthenticator(buf []byte, length int) error {
 			v.mac.Write(buf)
 			v.sum = v.mac.Sum(v.sum[:0])
 			if !hmac.Equal(got[:], v.sum) {
-				return ErrBadMessageAuth
+				return found, ErrBadMessageAuth
 			}
 			// Restore it; the authenticator digest covers the packet with the
 			// completed Message-Authenticator in place.
@@ -516,7 +540,7 @@ func (v *Verifier) checkMessageAuthenticator(buf []byte, length int) error {
 		}
 		i += alen
 	}
-	return nil
+	return found, nil
 }
 
 // VerifyRequest checks a received request.
@@ -552,7 +576,11 @@ func (v *Verifier) VerifyRequest(req []byte) error {
 		copy(buf[4:HeaderLen], zeros[:])
 	}
 
-	if err := v.checkMessageAuthenticator(buf, length); err != nil {
+	// RFC 5176 section 3.4 makes the Message-Authenticator a MAY for CoA and
+	// Disconnect, and requires only that it be checked when present, so a
+	// request without one is not refused here. Their authenticator is derived
+	// from the packet and the secret, which already proves the sender knew it.
+	if _, err := v.checkMessageAuthenticator(buf, length); err != nil {
 		return err
 	}
 
