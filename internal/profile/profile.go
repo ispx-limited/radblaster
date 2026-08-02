@@ -103,8 +103,50 @@ type NAS struct {
 	CallingStationID string `yaml:"callingStationId,omitempty" json:"callingStationId,omitempty"`
 }
 
+// ErrCredentialAttribute is returned for a profile carrying a credential as an
+// extra attribute.
+var ErrCredentialAttribute = errors.New("profile: a credential cannot be saved in a profile")
+
+// credentialAttrs are attributes a profile must not carry a value for.
+//
+// A profile has no field for a shared secret or a password, which is most of
+// the guarantee, but extra attributes are free-form: writing "User-Password"
+// as one puts a credential into a file meant to be committed, directly beneath
+// a header saying there are none. The absence of a field is what made the
+// promise; this is what keeps it.
+var credentialAttrs = map[string]bool{
+	"user-password":      true,
+	"chap-password":      true,
+	"chap-challenge":     true,
+	"ms-chap-password":   true,
+	"ms-chap-challenge":  true,
+	"ms-chap2-password":  true,
+	"tunnel-password":    true,
+	"ascend-send-secret": true,
+}
+
+// checkAttributes refuses a credential written as an extra attribute.
+func checkAttributes(attrs []Attr) error {
+	for _, a := range attrs {
+		name := strings.ToLower(strings.TrimSpace(a.Name))
+		// Dictionaries write a vendor attribute either qualified or bare, so
+		// compare on the last component either way.
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		if credentialAttrs[name] {
+			return fmt.Errorf("%w: %s is supplied when the run starts, not saved in the file", ErrCredentialAttribute, a.Name)
+		}
+	}
+	return nil
+}
+
 // Marshal renders a profile as YAML.
 func (p *Profile) Marshal() ([]byte, error) {
+	if err := checkAttributes(p.Attributes); err != nil {
+		return nil, err
+	}
+
 	var b strings.Builder
 	b.WriteString("# radblaster profile\n")
 	b.WriteString("# Secrets are deliberately absent. Supply them when the run starts.\n")
@@ -134,7 +176,10 @@ type Store struct{ dir string }
 
 // NewStore returns a store over dir, creating it if it is missing.
 func NewStore(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Profiles describe an estate: which servers, which usernames, which NAS
+	// identifiers. That is not a credential but it is not public either, so the
+	// directory is not world-readable.
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("profile: creating %s: %w", dir, err)
 	}
 	return &Store{dir: dir}, nil

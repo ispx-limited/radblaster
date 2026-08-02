@@ -215,3 +215,33 @@ func TestMarshalledProfileIsReadable(t *testing.T) {
 		}
 	}
 }
+
+// A profile is meant to be committed, and it says so at the top of the file.
+// An extra attribute is the one way a credential could still get in.
+func TestProfileRefusesToSaveACredentialAttribute(t *testing.T) {
+	for _, name := range []string{"User-Password", "user-password", "CHAP-Password", "Tunnel-Password"} {
+		p := &Profile{
+			Name:       "estate",
+			Server:     "10.0.0.1:1812",
+			Attributes: []Attr{{Name: name, Value: "hunter2"}},
+		}
+		if _, err := p.Marshal(); !errors.Is(err, ErrCredentialAttribute) {
+			t.Errorf("Marshal with %s: err = %v, want ErrCredentialAttribute", name, err)
+		}
+	}
+}
+
+func TestProfileStillSavesOrdinaryAttributes(t *testing.T) {
+	p := &Profile{
+		Name:       "estate",
+		Server:     "10.0.0.1:1812",
+		Attributes: []Attr{{Name: "Cisco-AVPair", Value: "ip:qos-policy-in=voice"}},
+	}
+	b, err := p.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(b), "Cisco-AVPair") {
+		t.Error("the attribute was not written")
+	}
+}
