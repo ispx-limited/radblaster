@@ -56,15 +56,16 @@ func (d *Dictionary) Clone() *Dictionary {
 // resolve the same names to the same numbers.
 func LoadDictionary(paths ...string) (*Dictionary, error) {
 	d := StandardDictionary().Clone()
+	seen := make(map[string]bool)
 	for _, p := range paths {
-		if err := d.loadPath(p, 0); err != nil {
+		if err := d.loadPath(p, 0, seen); err != nil {
 			return nil, err
 		}
 	}
 	return d, nil
 }
 
-func (d *Dictionary) loadPath(path string, depth int) error {
+func (d *Dictionary) loadPath(path string, depth int, seen map[string]bool) error {
 	if depth > maxIncludeDepth {
 		return fmt.Errorf("radius: dictionary includes nested more than %d deep at %s", maxIncludeDepth, path)
 	}
@@ -74,7 +75,7 @@ func (d *Dictionary) loadPath(path string, depth int) error {
 		return fmt.Errorf("radius: reading dictionary %s: %w", path, err)
 	}
 	if !info.IsDir() {
-		return d.loadFile(path, depth)
+		return d.loadFile(path, depth, seen)
 	}
 
 	entries, err := os.ReadDir(path)
@@ -85,27 +86,62 @@ func (d *Dictionary) loadPath(path string, depth int) error {
 		if e.IsDir() {
 			continue
 		}
-		if err := d.loadFile(filepath.Join(path, e.Name()), depth); err != nil {
+		if err := d.loadFile(filepath.Join(path, e.Name()), depth, seen); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *Dictionary) loadFile(path string, depth int) error {
+func (d *Dictionary) loadFile(path string, depth int, seen map[string]bool) error {
+	// A dictionary set includes the same file from several places, and every
+	// $INCLUDE used to read it again from scratch. That makes the work a tree
+	// rather than a walk, so a handful of small files including each other a
+	// few times over expands into billions of parses and exhausts the machine
+	// before it finishes. Reading each file once is also what the servers these
+	// dictionaries come from do, and it stops a VALUE line being applied
+	// repeatedly by the same file arriving twice.
+	key := resolvedPath(path)
+	if seen[key] {
+		return nil
+	}
+	seen[key] = true
+
+	// Stat before opening: a pipe in a dictionary directory is not a
+	// dictionary, and opening one blocks for as long as nothing writes to it.
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("radius: reading dictionary %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("radius: reading dictionary %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	return d.parse(f, path, depth)
+	return d.parse(f, path, depth, seen)
+}
+
+// resolvedPath names a file the same way however it was reached, so that one
+// file included by two different routes is recognised as one file.
+func resolvedPath(path string) string {
+	if p, err := filepath.EvalSymlinks(path); err == nil {
+		return p
+	}
+	if p, err := filepath.Abs(path); err == nil {
+		return p
+	}
+	return path
 }
 
 // parse reads one dictionary file. Directives it does not recognise are
 // skipped rather than rejected: real dictionary sets carry constructs beyond
 // this subset, and refusing to load a whole file over one unfamiliar line
 // would make the feature useless in practice.
-func (d *Dictionary) parse(r io.Reader, path string, depth int) error {
+func (d *Dictionary) parse(r io.Reader, path string, depth int, seen map[string]bool) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -142,7 +178,7 @@ func (d *Dictionary) parse(r io.Reader, path string, depth int) error {
 			if !filepath.IsAbs(inc) {
 				inc = filepath.Join(filepath.Dir(path), inc)
 			}
-			if err := d.loadPath(inc, depth+1); err != nil {
+			if err := d.loadPath(inc, depth+1, seen); err != nil {
 				return err
 			}
 
@@ -162,7 +198,7 @@ func (d *Dictionary) parse(r io.Reader, path string, depth int) error {
 			}
 			id, ok := d.vendorIDs[strings.ToLower(fields[1])]
 			if !ok {
-				return dictErr(path, line, "BEGIN-VENDOR names an undeclared vendor "+fields[1])
+				return dictErr(path, line, "BEGIN-VENDOR names an undeclared vendor "+asField(fields[1]))
 			}
 			vendor = id
 
@@ -216,6 +252,20 @@ func (d *Dictionary) parse(r io.Reader, path string, depth int) error {
 
 func dictErr(path string, line int, msg string) error {
 	return fmt.Errorf("radius: %s line %d: %s", path, line, msg)
+}
+
+// asField prepares a token from a file to be quoted in an error message.
+//
+// Pointing this at something that is not a dictionary should say so without
+// reprinting the file: a long line, or one carrying something private, has no
+// business being repeated at length in an error an operator may well paste
+// somewhere else.
+func asField(s string) string {
+	const max = 40
+	if len(s) > max {
+		s = s[:max] + "..."
+	}
+	return strconv.Quote(s)
 }
 
 // parseNumber accepts decimal and hexadecimal, which dictionaries mix freely.
