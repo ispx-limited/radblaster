@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -67,6 +66,12 @@ type session struct {
 	username      string
 	acctSessionID string
 
+	// callingStationID and nasPortID are rendered once here rather than for
+	// every packet, because they depend only on the session number and a
+	// subscriber that stays online sends a great many packets.
+	callingStationID string
+	nasPortID        string
+
 	// class and framedIP are taken from the Access-Accept. Echoing Class
 	// back in accounting is required by RFC 2865 and is a real test of the
 	// whole chain, including any proxy in the path.
@@ -108,19 +113,52 @@ func newSession(index uint32, seq uint64, cfg *Config, runID uint32, rng *rand.R
 		seq:      seq,
 		state:    stateNew,
 		queueIdx: -1,
-		username: expandUsername(cfg.Username, seq),
+		username: cfg.username.render(seq),
 		// Unique per run and stable for the life of the session, which is
 		// what a server keys its session table on.
-		acctSessionID: fmt.Sprintf("%08X-%08X", runID, seq),
-		interim:       cfg.InterimInterval,
-		up:            drawRate(cfg.TrafficUp, cfg.TrafficUpMax, rng),
-		down:          drawRate(cfg.TrafficDown, cfg.TrafficDownMax, rng),
+		acctSessionID:    acctSessionID(runID, seq),
+		callingStationID: cfg.callingStationID.render(seq),
+		nasPortID:        cfg.nasPortID.render(seq),
+		interim:          cfg.InterimInterval,
+		up:               drawRate(cfg.TrafficUp, cfg.TrafficUpMax, rng),
+		down:             drawRate(cfg.TrafficDown, cfg.TrafficDownMax, rng),
 	}
 	if cfg.RejectRate > 0 && rng.Float64() < cfg.RejectRate {
 		s.reject = true
 		s.username = rejectUsername(cfg, seq)
 	}
 	return s
+}
+
+// acctSessionID formats the Acct-Session-Id a session carries for its whole
+// life. It is written by hand rather than with fmt because it is produced once
+// per subscriber, and a run sets up millions of them.
+func acctSessionID(runID uint32, seq uint64) string {
+	var b [40]byte
+	out := appendHex(b[:0], uint64(runID), 8)
+	out = append(out, '-')
+	out = appendHex(out, seq, 8)
+	return string(out)
+}
+
+// appendHex appends v in upper case hexadecimal, zero padded to at least width
+// digits.
+func appendHex(dst []byte, v uint64, width int) []byte {
+	const digits = "0123456789ABCDEF"
+	var tmp [16]byte
+	i := len(tmp)
+	for {
+		i--
+		tmp[i] = digits[v&0xf]
+		v >>= 4
+		if v == 0 {
+			break
+		}
+	}
+	for n := len(tmp) - i; n < width; n++ {
+		dst = append(dst, '0')
+	}
+	return append(dst, tmp[i:]...)
 }
 
 // drawRate picks a subscriber's traffic rate, uniformly across the range when
@@ -137,63 +175,84 @@ func drawRate(min, max uint64, rng *rand.Rand) uint64 {
 // asking for one rather than as a real subscriber failing to get online.
 func rejectUsername(cfg *Config, seq uint64) string {
 	if cfg.RejectUsername != "" {
-		return expandUsername(cfg.RejectUsername, seq)
+		return cfg.rejectUsername.render(seq)
 	}
 	return "radblaster-unknown-" + strconv.FormatUint(seq, 10) + "@invalid"
 }
 
+// template is a string that may carry {n} for the session number, with the
+// search for it done once at startup rather than for every subscriber it is
+// rendered for.
+type template struct {
+	raw string
+	has bool
+}
+
+func newTemplate(s string) template {
+	return template{raw: s, has: strings.Contains(s, "{n}")}
+}
+
+// render substitutes the session number, returning the template unchanged when
+// it carries no placeholder.
+func (t template) render(seq uint64) string {
+	if !t.has {
+		return t.raw
+	}
+	return strings.ReplaceAll(t.raw, "{n}", strconv.FormatUint(seq, 10))
+}
+
 // expandUsername substitutes the session number into a template.
 func expandUsername(tmpl string, seq uint64) string {
-	if !strings.Contains(tmpl, "{n}") {
-		return tmpl
-	}
-	return strings.ReplaceAll(tmpl, "{n}", strconv.FormatUint(seq, 10))
+	return newTemplate(tmpl).render(seq)
 }
 
 // buildAccess fills in an Access-Request for this subscriber.
-func (s *session) buildAccess(p *radius.Packet, cfg *Config, rng interface{ UintN(uint) uint }) error {
-	p.AddString(radius.AttrUserName, s.username)
+func (s *session) buildAccess(b *requestBuilder, cfg *Config, rng interface{ UintN(uint) uint }) error {
+	p := &b.pkt
+	b.addString(radius.AttrUserName, s.username)
 
 	switch cfg.Auth {
 	case AuthCHAP:
 		ident := uint8(rng.UintN(256))
 		// With no CHAP-Challenge attribute the request authenticator serves
 		// as the challenge, per RFC 2865 section 5.3.
-		resp := radius.CHAPPassword(ident, []byte(cfg.Password), p.Authenticator[:])
-		p.Add(radius.AttrCHAPPassword, resp[:])
+		resp := radius.CHAPPassword(ident, cfg.password, p.Authenticator[:])
+		b.add(radius.AttrCHAPPassword, resp[:])
 	default:
 		// PAP and IPoE put the same attribute on the wire. They differ in
 		// what it means: for PPPoE it is the subscriber's password, and for
 		// IPoE it is a fixed service password the access node was configured
 		// with, present only because an Access-Request has to carry one.
-		enc, err := radius.EncryptUserPassword(nil, []byte(cfg.Password), cfg.Secret, p.Authenticator)
+		start := b.value()
+		vals, err := radius.EncryptUserPassword(b.vals, cfg.password, cfg.Secret, p.Authenticator)
 		if err != nil {
 			return err
 		}
-		p.Add(radius.AttrUserPassword, enc)
+		b.vals = vals
+		b.commit(0, radius.AttrUserPassword, start)
 	}
 
-	s.addCommon(p, cfg)
-	p.AddString(radius.AttrAcctSessionID, s.acctSessionID)
-	p.AddUint32(radius.AttrServiceType, 2)    // Framed-User
-	p.AddUint32(radius.AttrFramedProtocol, 1) // PPP
+	s.addCommon(b, cfg)
+	b.addString(radius.AttrAcctSessionID, s.acctSessionID)
+	b.addUint32(radius.AttrServiceType, 2)    // Framed-User
+	b.addUint32(radius.AttrFramedProtocol, 1) // PPP
 	return nil
 }
 
 // buildAcct fills in an Accounting-Request of the given status type.
-func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now time.Time, cause uint32) {
-	p.AddString(radius.AttrUserName, s.username)
-	p.AddString(radius.AttrAcctSessionID, s.acctSessionID)
-	p.AddUint32(radius.AttrAcctStatusType, status)
-	p.AddUint32(radius.AttrAcctAuthentic, 1) // RADIUS
+func (s *session) buildAcct(b *requestBuilder, cfg *Config, status uint32, now time.Time, cause uint32) {
+	b.addString(radius.AttrUserName, s.username)
+	b.addString(radius.AttrAcctSessionID, s.acctSessionID)
+	b.addUint32(radius.AttrAcctStatusType, status)
+	b.addUint32(radius.AttrAcctAuthentic, 1) // RADIUS
 
 	if len(s.class) > 0 {
-		p.Add(radius.AttrClass, s.class)
+		b.add(radius.AttrClass, s.class)
 	}
 	if s.hasIP {
-		p.Add(radius.AttrFramedIPAddress, s.framedIP[:])
+		b.add(radius.AttrFramedIPAddress, s.framedIP[:])
 	}
-	s.addCommon(p, cfg)
+	s.addCommon(b, cfg)
 
 	if status == acctStart {
 		return
@@ -203,29 +262,29 @@ func (s *session) buildAcct(p *radius.Packet, cfg *Config, status uint32, now ti
 	if elapsed < 0 {
 		elapsed = 0
 	}
-	p.AddUint32(radius.AttrAcctSessionTime, uint32(elapsed.Seconds()))
+	b.addUint32(radius.AttrAcctSessionTime, uint32(elapsed.Seconds()))
 
 	in, out := s.octets(elapsed)
 	// Octet counters are 32 bits wide, so anything past four gibibytes is
 	// carried in the matching Gigawords attribute. Plenty of accounting
 	// pipelines mishandle that rollover, which is exactly why a load tool
 	// should reproduce it rather than quietly staying under the limit.
-	p.AddUint32(radius.AttrAcctInputOctets, uint32(in))
-	p.AddUint32(radius.AttrAcctOutputOctets, uint32(out))
+	b.addUint32(radius.AttrAcctInputOctets, uint32(in))
+	b.addUint32(radius.AttrAcctOutputOctets, uint32(out))
 	if hi := uint32(in >> 32); hi > 0 {
-		p.AddUint32(radius.AttrAcctInputGigawords, hi)
+		b.addUint32(radius.AttrAcctInputGigawords, hi)
 	}
 	if hi := uint32(out >> 32); hi > 0 {
-		p.AddUint32(radius.AttrAcctOutputGigawords, hi)
+		b.addUint32(radius.AttrAcctOutputGigawords, hi)
 	}
-	p.AddUint32(radius.AttrAcctInputPackets, uint32(in/1400))
-	p.AddUint32(radius.AttrAcctOutputPackets, uint32(out/1400))
+	b.addUint32(radius.AttrAcctInputPackets, uint32(in/1400))
+	b.addUint32(radius.AttrAcctOutputPackets, uint32(out/1400))
 
 	if status == acctStop {
 		if cause == 0 {
 			cause = cfg.terminateCause()
 		}
-		p.AddUint32(radius.AttrAcctTerminateCause, cause)
+		b.addUint32(radius.AttrAcctTerminateCause, cause)
 	}
 }
 
@@ -237,23 +296,23 @@ func (s *session) octets(elapsed time.Duration) (in, out uint64) {
 
 // addCommon adds the attributes a BNG would put on every packet for a
 // subscriber, regardless of which exchange it is.
-func (s *session) addCommon(p *radius.Packet, cfg *Config) {
+func (s *session) addCommon(b *requestBuilder, cfg *Config) {
 	if cfg.NASIdentifier != "" {
-		p.AddString(radius.AttrNASIdentifier, cfg.NASIdentifier)
+		b.addString(radius.AttrNASIdentifier, cfg.NASIdentifier)
 	}
 	if cfg.NASIPAddress != nil {
-		p.Add(radius.AttrNASIPAddress, cfg.NASIPAddress)
+		b.add(radius.AttrNASIPAddress, cfg.NASIPAddress)
 	}
 	if cfg.NASPortType > 0 {
-		p.AddUint32(radius.AttrNASPortType, cfg.NASPortType)
+		b.addUint32(radius.AttrNASPortType, cfg.NASPortType)
 	}
-	if cfg.CallingStationID != "" {
-		p.AddString(radius.AttrCallingStationID, expandUsername(cfg.CallingStationID, s.seq))
+	if s.callingStationID != "" {
+		b.addString(radius.AttrCallingStationID, s.callingStationID)
 	}
-	if cfg.NASPortID != "" {
-		p.AddString(radius.AttrNASPortID, expandUsername(cfg.NASPortID, s.seq))
+	if s.nasPortID != "" {
+		b.addString(radius.AttrNASPortID, s.nasPortID)
 	}
-	p.AddUint32(radius.AttrNASPort, uint32(s.seq))
+	b.addUint32(radius.AttrNASPort, uint32(s.seq))
 
 	for i := range cfg.prepared {
 		e := &cfg.prepared[i]
@@ -261,15 +320,13 @@ func (s *session) addCommon(p *radius.Packet, cfg *Config) {
 		if v == nil {
 			// Templated, so it has to be rendered for this subscriber.
 			var err error
-			if v, err = e.spec.EncodeValue(expandUsername(e.spec.Value, s.seq)); err != nil {
+			if v, err = e.spec.EncodeValue(e.value.render(s.seq)); err != nil {
 				continue
 			}
 		}
-		p.Attributes = append(p.Attributes, radius.Attribute{
-			Type:   e.spec.Type,
-			Vendor: e.spec.Vendor,
-			Value:  v,
-		})
+		start := b.value()
+		b.vals = append(b.vals, v...)
+		b.commit(e.spec.Vendor, e.spec.Type, start)
 	}
 }
 

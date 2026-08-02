@@ -47,8 +47,16 @@ type pending struct {
 type link struct {
 	conn    *net.UDPConn
 	enc     *radius.Encoder
+	ver     *radius.Verifier
+	rnd     *radius.Rand
 	ids     *radius.IDPool
 	pending [radius.IDSpace]pending
+
+	// build assembles the next request and reply holds the last one decoded.
+	// Both are reused rather than allocated per packet, which at rate is the
+	// difference between measuring the server and measuring the collector.
+	build requestBuilder
+	reply radius.Packet
 }
 
 func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
@@ -60,11 +68,77 @@ func newLink(server string, secret []byte, r *rand.Rand) (*link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("engine: opening socket to %s: %w", server, err)
 	}
-	return &link{
+
+	l := &link{
 		conn: conn,
 		enc:  radius.NewEncoder(secret),
+		ver:  radius.NewVerifier(secret),
+		rnd:  radius.NewRand(),
 		ids:  radius.NewIDPool(r),
-	}, nil
+	}
+	l.build.init()
+	return l, nil
+}
+
+// builderArena is how much attribute value storage one request is built in.
+// Comfortably more than a subscriber's worth of attributes, so the arena is
+// sized once and never grown.
+const builderArena = 1024
+
+// requestBuilder assembles a request into storage that is reused for the next
+// one.
+//
+// Attribute values are written into a single arena rather than allocated
+// individually, and the packet keeps its attribute slice between requests. A
+// value handed out stays readable even if a later append grows the arena,
+// because the slice given to the packet still refers to the storage the value
+// was written into.
+type requestBuilder struct {
+	pkt  radius.Packet
+	vals []byte
+}
+
+func (b *requestBuilder) init() {
+	b.vals = make([]byte, 0, builderArena)
+	b.pkt.Attributes = make([]radius.Attribute, 0, 24)
+}
+
+// reset starts a fresh request of the given code and identifier.
+func (b *requestBuilder) reset(code radius.Code, id uint8) *radius.Packet {
+	b.pkt.Reset(code, id)
+	b.vals = b.vals[:0]
+	return &b.pkt
+}
+
+// value returns the arena position a value is about to be written at.
+func (b *requestBuilder) value() int { return len(b.vals) }
+
+// commit records everything written to the arena since start as an attribute.
+func (b *requestBuilder) commit(vendor uint32, t radius.AttrType, start int) {
+	v := b.vals[start:len(b.vals):len(b.vals)]
+	b.pkt.Attributes = append(b.pkt.Attributes, radius.Attribute{
+		Type:   t,
+		Vendor: vendor,
+		Value:  v,
+	})
+}
+
+func (b *requestBuilder) add(t radius.AttrType, v []byte) {
+	start := b.value()
+	b.vals = append(b.vals, v...)
+	b.commit(0, t, start)
+}
+
+func (b *requestBuilder) addString(t radius.AttrType, v string) {
+	start := b.value()
+	b.vals = append(b.vals, v...)
+	b.commit(0, t, start)
+}
+
+func (b *requestBuilder) addUint32(t radius.AttrType, v uint32) {
+	start := b.value()
+	b.vals = append(b.vals, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	b.commit(0, t, start)
 }
 
 func (l *link) close() {

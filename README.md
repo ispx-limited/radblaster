@@ -15,9 +15,11 @@ radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
 ## Status
 
 Early but useful. The full subscriber session lifecycle works end to end
-against a real RADIUS server, including server-initiated disconnects, and on a
-desktop machine authentication alone sustains over 100,000 requests per second.
-There is a web interface for driving runs and watching them happen.
+against a real RADIUS server, including server-initiated disconnects. On a
+24 thread desktop, answered by a responder that does nothing but reply,
+authentication alone sustains over two million requests per second with no
+packets dropped, so what a run measures is the server rather than the
+generator. There is a web interface for driving runs and watching them happen.
 
 What works:
 

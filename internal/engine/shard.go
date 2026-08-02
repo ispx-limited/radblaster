@@ -150,6 +150,20 @@ func (s *shard) nthSession(n uint64) float64 {
 func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 	lastSweep := started
 
+	// The unpaced loop spins as fast as the links allow, so asking a context
+	// whether it is finished costs real throughput: Err takes a lock, and this
+	// is checked once per iteration and once per session offered. Reading the
+	// done channel answers the same question without one.
+	done := ctx.Done()
+	finished := func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+
 	// Whether a run is paced is a property of its settings, not of the rate at
 	// any one moment. A ramp starts at zero and climbs, so asking for the rate
 	// at the start would read as unpaced and stay that way for the whole run.
@@ -161,7 +175,7 @@ func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 	nextSetup := started.Add(s.cfg.timeFor(s.nthSession(1)))
 
 	for {
-		if ctx.Err() != nil {
+		if finished() {
 			return
 		}
 
@@ -208,9 +222,17 @@ func (s *shard) loop(ctx context.Context, started time.Time, seq *counter) {
 			if batch >= maxBatch {
 				break
 			}
-			if ctx.Err() != nil {
+			if finished() {
 				return
 			}
+		}
+
+		// The setup window closes at the last batch rather than the last
+		// session. Reading the clock for every session in a batch of hundreds
+		// costs more than the resolution it buys, and the window is only ever
+		// used to divide a run's sessions by the time they took.
+		if batch > 0 {
+			s.markSetup()
 		}
 
 		// The run is over once no more sessions can be set up and every
@@ -374,6 +396,14 @@ func (s *shard) nextDue() (time.Time, bool) {
 	return s.due[0].nextAt, true
 }
 
+// markSetup records that this shard has just set sessions up.
+func (s *shard) markSetup() {
+	now := time.Now()
+	s.mu.Lock()
+	s.lastSetupAt = now
+	s.mu.Unlock()
+}
+
 func (s *shard) countBlocked(e Exchange) {
 	s.mu.Lock()
 	s.metrics[e].Blocked++
@@ -387,7 +417,6 @@ func (s *shard) startSession(seq uint64, dueAt time.Time) {
 	s.nextIdx++
 	sess := newSession(idx, seq, s.cfg, s.runID, s.rng)
 	s.sessions[idx] = sess
-	s.lastSetupAt = time.Now()
 	s.mu.Unlock()
 
 	s.sendAccess(sess, dueAt)
@@ -480,6 +509,10 @@ func (s *shard) finish(sess *session, completed bool) {
 }
 
 // sendAccess builds and sends the session's Access-Request.
+//
+// The packet is assembled in the link's own reusable storage, which is why
+// building and sending happen under one hold of the lock: the next request
+// overwrites it.
 func (s *shard) sendAccess(sess *session, dueAt time.Time) {
 	s.mu.Lock()
 	id, ok := s.auth.ids.Get()
@@ -489,20 +522,20 @@ func (s *shard) sendAccess(sess *session, dueAt time.Time) {
 		s.mu.Unlock()
 		return
 	}
-	s.mu.Unlock()
 
-	p, err := radius.New(radius.CodeAccessRequest, id)
-	if err != nil {
-		s.abort(s.auth, id, sess, ExchangeAccess)
-		return
-	}
-	if err := sess.buildAccess(p, s.cfg, s.rng); err != nil {
-		s.abort(s.auth, id, sess, ExchangeAccess)
+	p := s.auth.build.reset(radius.CodeAccessRequest, id)
+	p.SetAuthenticator(s.auth.rnd)
+	if err := sess.buildAccess(&s.auth.build, s.cfg, s.rng); err != nil {
+		s.auth.ids.Put(id)
+		s.metrics[ExchangeAccess].Malformed++
+		delete(s.sessions, sess.index)
+		s.mu.Unlock()
 		return
 	}
 
 	sess.state = stateAuthenticating
 	s.transmit(s.auth, p, sess, ExchangeAccess, id, dueAt)
+	s.mu.Unlock()
 }
 
 // sendAcct builds and sends one accounting record.
@@ -518,38 +551,20 @@ func (s *shard) sendAcct(sess *session, e Exchange, status uint32, dueAt, now ti
 		s.mu.Unlock()
 		return
 	}
-	s.mu.Unlock()
 
-	p, err := radius.New(radius.CodeAccountingRequest, id)
-	if err != nil {
-		s.mu.Lock()
-		s.acct.ids.Put(id)
-		s.metrics[e].Malformed++
-		s.mu.Unlock()
-		return
-	}
-	sess.buildAcct(p, s.cfg, status, now, cause)
+	p := s.acct.build.reset(radius.CodeAccountingRequest, id)
+	sess.buildAcct(&s.acct.build, s.cfg, status, now, cause)
 
 	s.transmit(s.acct, p, sess, e, id, dueAt)
-}
-
-// abort releases an identifier for a request that could not be built.
-func (s *shard) abort(l *link, id uint8, sess *session, e Exchange) {
-	s.mu.Lock()
-	l.ids.Put(id)
-	s.metrics[e].Malformed++
-	delete(s.sessions, sess.index)
 	s.mu.Unlock()
 }
 
-// transmit encodes, records and sends one request.
+// transmit encodes, records and sends one request. The caller holds the lock.
 func (s *shard) transmit(l *link, p *radius.Packet, sess *session, e Exchange, id uint8, dueAt time.Time) {
-	s.mu.Lock()
 	wire, err := l.enc.Encode(p)
 	if err != nil {
 		l.ids.Put(id)
 		s.metrics[e].Malformed++
-		s.mu.Unlock()
 		return
 	}
 
@@ -576,8 +591,6 @@ func (s *shard) transmit(l *link, p *radius.Packet, sess *session, e Exchange, i
 	}
 	s.metrics[e].Sent++
 
-	// The encoder's buffer is reused on its next call, so the bytes must go
-	// out before the lock is released.
 	_, werr := l.conn.Write(slot.wire)
 	if werr != nil {
 		l.pending[id].active = false
@@ -585,27 +598,47 @@ func (s *shard) transmit(l *link, p *radius.Packet, sess *session, e Exchange, i
 		s.metrics[e].Sent--
 		s.metrics[e].Malformed++
 	}
-	s.mu.Unlock()
 }
+
+// receiveDeadline bounds how long a receiver parks before it looks at the run
+// state again. It is a backstop rather than the way a run ends: stopping sets
+// the deadline to now, which wakes the reader immediately. Refreshing it once
+// per interval rather than once per packet matters, because at rate the timer
+// work costs more than the read it guards.
+const receiveDeadline = time.Second
 
 func (s *shard) receive(ctx context.Context, l *link) {
 	buf := make([]byte, radius.MaxPacketLen)
+	if err := l.conn.SetReadDeadline(time.Now().Add(receiveDeadline)); err != nil {
+		return
+	}
+	done := ctx.Done()
+
 	for {
-		if s.stopped.Load() || ctx.Err() != nil {
+		if s.stopped.Load() {
 			return
 		}
-		// A deadline keeps the read from parking forever once the run is
-		// over, without needing to close the socket from another goroutine.
-		_ = l.conn.SetReadDeadline(time.Now().Add(sweepInterval))
+		select {
+		case <-done:
+			return
+		default:
+		}
 
 		n, err := l.conn.Read(buf)
+		at := time.Now()
 		if err != nil {
-			if isTimeout(err) {
-				continue
+			if !isTimeout(err) {
+				return
 			}
-			return
+			// Either the backstop expired with the run still going, or the run
+			// is stopping and set the deadline to wake us. The checks at the
+			// top of the loop tell the two apart.
+			if err := l.conn.SetReadDeadline(at.Add(receiveDeadline)); err != nil {
+				return
+			}
+			continue
 		}
-		s.handle(l, buf[:n], time.Now())
+		s.handle(l, buf[:n], at)
 	}
 }
 
@@ -627,7 +660,7 @@ func (s *shard) handle(l *link, reply []byte, at time.Time) {
 	}
 	m := s.metrics[p.exchange]
 
-	if err := radius.Verify(reply, p.auth, s.cfg.Secret); err != nil {
+	if err := l.ver.Verify(reply, p.auth); err != nil {
 		// Do not release the identifier here. A forged or mis-signed packet
 		// must not be able to cancel a request that is still legitimately
 		// outstanding, or an attacker could free identifiers at will.
@@ -635,8 +668,8 @@ func (s *shard) handle(l *link, reply []byte, at time.Time) {
 		return
 	}
 
-	decoded, err := radius.Decode(reply)
-	if err != nil {
+	decoded := &l.reply
+	if err := radius.DecodeInto(decoded, reply); err != nil {
 		m.Malformed++
 		return
 	}

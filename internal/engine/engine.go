@@ -6,8 +6,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ispx-limited/radblaster/internal/radius"
@@ -22,6 +21,9 @@ import (
 type extraAttr struct {
 	spec   radius.AttrSpec
 	static []byte
+	// value is the spec's value with its placeholder already located, so a
+	// templated attribute is not searched again for every subscriber.
+	value template
 }
 
 // Auth selects how a subscriber proves its identity.
@@ -146,6 +148,15 @@ type Config struct {
 	// prepared holds Attributes with their values already encoded where they
 	// are constant, so the send path only renders the ones that vary.
 	prepared []extraAttr
+
+	// The templated strings with their placeholders located once, and the
+	// password as the bytes that go on the wire, so setting a subscriber up
+	// does no string searching and no conversion.
+	username         template
+	rejectUsername   template
+	callingStationID template
+	nasPortID        template
+	password         []byte
 
 	// CoAListen is the address to accept CoA-Request and Disconnect-Request
 	// on, for example ":3799". Empty means the run does not present itself as
@@ -376,6 +387,12 @@ func (c *Config) validate() error {
 	case c.accounting() && c.InterimInterval < 0:
 		return errors.New("engine: interim interval cannot be negative")
 	}
+	c.username = newTemplate(c.Username)
+	c.rejectUsername = newTemplate(c.RejectUsername)
+	c.callingStationID = newTemplate(c.CallingStationID)
+	c.nasPortID = newTemplate(c.NASPortID)
+	c.password = []byte(c.Password)
+
 	return c.prepareAttributes()
 }
 
@@ -385,8 +402,8 @@ func (c *Config) validate() error {
 func (c *Config) prepareAttributes() error {
 	c.prepared = make([]extraAttr, 0, len(c.Attributes))
 	for _, spec := range c.Attributes {
-		e := extraAttr{spec: spec}
-		if !strings.Contains(spec.Value, "{n}") {
+		e := extraAttr{spec: spec, value: newTemplate(spec.Value)}
+		if !e.value.has {
 			v, err := spec.EncodeValue(spec.Value)
 			if err != nil {
 				return err
@@ -513,27 +530,27 @@ func (r *Result) Accounting() bool {
 }
 
 // counter hands out session sequence numbers across shards.
+//
+// Every shard takes from it for every session it offers, which at rate is the
+// one piece of state the whole run shares. An atomic add keeps that from
+// becoming a queue: overshooting the limit is corrected by handing back a
+// refusal rather than by holding a lock to prevent it.
 type counter struct {
-	mu    sync.Mutex
-	next  uint64
+	next  atomic.Uint64
 	limit uint64
 }
 
 // take reserves the next sequence number. It reports false once the limit is
 // reached.
 func (c *counter) take() (uint64, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.limit > 0 && c.next >= c.limit {
+	n := c.next.Add(1)
+	if c.limit > 0 && n > c.limit {
 		return 0, false
 	}
-	c.next++
-	return c.next, true
+	return n, true
 }
 
 // remaining reports whether any sequence numbers are left.
 func (c *counter) remaining() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.limit == 0 || c.next < c.limit
+	return c.limit == 0 || c.next.Load() < c.limit
 }
