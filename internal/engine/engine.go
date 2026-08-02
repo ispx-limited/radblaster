@@ -187,8 +187,20 @@ const (
 	maxDefaultLinks = 64
 )
 
+// MaxLinks is the most source ports a run will open per endpoint.
+//
+// Every link costs two sockets and their buffers, so a large number is a real
+// request for memory and file descriptors; asking for an absurd one is how a
+// run brings down the machine it is driven from rather than the server it is
+// aimed at. The ceiling is well above any rate a generator can usefully offer
+// and is here to make a typo or a hostile caller fail cleanly instead.
+const MaxLinks = 4096
+
 func (c *Config) links() int {
 	if c.Links > 0 {
+		if c.Links > MaxLinks {
+			return MaxLinks
+		}
 		return c.Links
 	}
 	n := runtime.NumCPU() * linksPerCPU
@@ -398,6 +410,18 @@ func (c *Config) validate() error {
 		return fmt.Errorf("engine: unknown authentication method %q", c.Auth)
 	case c.RejectRate < 0 || c.RejectRate > 1:
 		return errors.New("engine: the reject rate must be between 0 and 1")
+	case c.Links < 0:
+		return errors.New("engine: the number of links cannot be negative")
+	case c.Links > MaxLinks:
+		return fmt.Errorf("engine: %d links is more than the %d this will open; "+
+			"a run is limited by the server long before this", c.Links, MaxLinks)
+	case c.Rate < 0:
+		// Zero means unpaced, which is deliberate. A negative rate is not a
+		// slower version of that, it is a mistake, and it would otherwise be
+		// silently read as unpaced too.
+		return errors.New("engine: the rate cannot be negative; leave it at zero to run unpaced")
+	case c.Retries < 0:
+		return errors.New("engine: the retry count cannot be negative")
 	case c.TrafficUpMax > 0 && c.TrafficUpMax < c.TrafficUp:
 		return errors.New("engine: the upstream traffic maximum is below its minimum")
 	case c.TrafficDownMax > 0 && c.TrafficDownMax < c.TrafficDown:
