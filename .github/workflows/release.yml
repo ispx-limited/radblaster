@@ -6,6 +6,10 @@ on:
 
 permissions:
   contents: write
+  # Both are needed to attest the archives: the first to mint the signing
+  # certificate, the second to record the attestation against the repository.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -25,11 +29,31 @@ jobs:
       - name: Test
         run: make test-race
 
+      # The tag name reaches a shell by way of VERSION, so anything that is not
+      # a plain version string is refused before it gets there rather than
+      # after.
+      - name: Check the tag name
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *[!0-9A-Za-z.+-]*|"")
+              echo "refusing tag '$GITHUB_REF_NAME': only 0-9 A-Z a-z . + - are allowed" >&2
+              exit 1
+              ;;
+          esac
+
       # The interface's built assets are committed, so the archives need
       # nothing but Go. The version comes from the tag rather than from
       # git describe, so the binary reports what was released.
       - name: Build release archives
         run: make dist VERSION="${GITHUB_REF_NAME#v}"
+
+      # Records who built these archives, from which commit, with which
+      # workflow, so a download can be checked against the run that produced
+      # it rather than only against a checksum published beside it.
+      - name: Attest the archives
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
 
       # Drafted rather than published: a person makes the final pass on the
       # notes before anything is announced.

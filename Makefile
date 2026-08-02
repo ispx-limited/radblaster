@@ -6,7 +6,9 @@ BIN     := $(BIN_DIR)/radblaster
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
-DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+# The committer date of the commit being built, not the wall clock, so that
+# building the same commit twice produces the same bytes.
+DATE    ?= $(shell git log -1 --format=%cI 2>/dev/null || echo unknown)
 
 LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) \
            -X $(MODULE)/internal/version.Commit=$(COMMIT) \
