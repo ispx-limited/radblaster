@@ -482,3 +482,76 @@ func TestVerifyLeavesInputUntouched(t *testing.T) {
 		t.Error("Verify mutated its input")
 	}
 }
+
+func TestVerifierMatchesPackageVerify(t *testing.T) {
+	req := benchPacket(CodeAccessRequest)
+	if _, err := req.Encode(nil, testSecret); err != nil {
+		t.Fatal(err)
+	}
+	reply := &Packet{Code: CodeAccessAccept, Identifier: req.Identifier}
+	wire, err := reply.EncodeResponse(nil, testSecret, req.Authenticator)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVerifier(testSecret)
+	// Twice, because a Verifier reuses its hash state and scratch buffer and
+	// must give the same answer on every call as the one-shot function does.
+	for i := 0; i < 2; i++ {
+		if err := v.Verify(wire, req.Authenticator); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if err := Verify(wire, req.Authenticator, testSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	wrong := req.Authenticator
+	wrong[0]++
+	if err := v.Verify(wire, wrong); err == nil {
+		t.Error("a reply to a different request verified")
+	}
+}
+
+func TestDecodeIntoReusesThePacket(t *testing.T) {
+	p := benchPacket(CodeAccessRequest)
+	wire, err := p.Encode(nil, testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var into Packet
+	for i := 0; i < 2; i++ {
+		if err := DecodeInto(&into, wire); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if got := len(into.Attributes); got != len(p.Attributes)+1 {
+			// The encoded form carries the Message-Authenticator as well.
+			t.Fatalf("call %d: got %d attributes, want %d", i, got, len(p.Attributes)+1)
+		}
+		if string(into.Get(AttrUserName)) != "subscriber@example.net" {
+			t.Fatalf("call %d: User-Name did not survive the decode", i)
+		}
+	}
+}
+
+func BenchmarkVerifierAccessAccept(b *testing.B) {
+	req := benchPacket(CodeAccessRequest)
+	if _, err := req.Encode(nil, testSecret); err != nil {
+		b.Fatal(err)
+	}
+	reply := &Packet{Code: CodeAccessAccept, Identifier: req.Identifier}
+	wire, err := reply.EncodeResponse(nil, testSecret, req.Authenticator)
+	if err != nil {
+		b.Fatal(err)
+	}
+	v := NewVerifier(testSecret)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := v.Verify(wire, req.Authenticator); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

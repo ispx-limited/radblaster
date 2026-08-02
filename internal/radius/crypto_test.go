@@ -194,3 +194,17 @@ func BenchmarkEncoderAccountingRequest(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkEncryptUserPassword(b *testing.B) {
+	var auth [AuthenticatorLen]byte
+	dst := make([]byte, 0, MaxValueLen)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		if dst, err = EncryptUserPassword(dst[:0], []byte("subscriber-secret"), testSecret, auth); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

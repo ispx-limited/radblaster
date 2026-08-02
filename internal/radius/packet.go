@@ -80,6 +80,25 @@ func New(code Code, identifier uint8) (*Packet, error) {
 	return p, nil
 }
 
+// Reset prepares p to be built again as a request of the given code and
+// identifier, keeping the attribute slice's capacity.
+//
+// A run sends millions of packets that differ only in their contents, and
+// allocating a fresh packet and attribute list for each one costs more than
+// signing it. The authenticator is left alone; a code that needs an
+// unpredictable one is given it by SetAuthenticator.
+func (p *Packet) Reset(code Code, identifier uint8) {
+	p.Code = code
+	p.Identifier = identifier
+	p.Attributes = p.Attributes[:0]
+	p.OmitMessageAuthenticator = false
+}
+
+// SetAuthenticator draws a fresh Request Authenticator from r.
+func (p *Packet) SetAuthenticator(r *Rand) {
+	r.Fill(p.Authenticator[:])
+}
+
 // Add appends an attribute carrying raw value bytes.
 func (p *Packet) Add(t AttrType, v []byte) {
 	p.Attributes = append(p.Attributes, Attribute{Type: t, Value: v})
@@ -338,28 +357,43 @@ func (p *Packet) hasAttr(t AttrType) bool {
 // callers that retain the packet beyond the lifetime of the receive buffer
 // must copy it first.
 func Decode(b []byte) (*Packet, error) {
+	p := &Packet{}
+	if err := DecodeInto(p, b); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// DecodeInto parses a RADIUS packet into p, reusing its attribute slice.
+//
+// A receiving loop that decodes into the same packet every time does not
+// allocate per reply. As with Decode the attribute values alias b, so p is only
+// valid until the receive buffer is overwritten.
+func DecodeInto(p *Packet, b []byte) error {
 	if len(b) < HeaderLen {
-		return nil, ErrShortPacket
+		return ErrShortPacket
 	}
 	length := int(binary.BigEndian.Uint16(b[2:4]))
 	if length < HeaderLen || length > MaxPacketLen {
-		return nil, fmt.Errorf("%w: %d", ErrBadLength, length)
+		return fmt.Errorf("%w: %d", ErrBadLength, length)
 	}
 	if len(b) < length {
-		return nil, ErrTruncated
+		return ErrTruncated
 	}
 	b = b[:length]
 
-	p := &Packet{Code: Code(b[0]), Identifier: b[1]}
+	p.Code = Code(b[0])
+	p.Identifier = b[1]
+	p.Attributes = p.Attributes[:0]
 	copy(p.Authenticator[:], b[4:HeaderLen])
 
 	for i := HeaderLen; i < length; {
 		if i+2 > length {
-			return nil, ErrBadAttribute
+			return ErrBadAttribute
 		}
 		alen := int(b[i+1])
 		if alen < 2 || i+alen > length {
-			return nil, ErrBadAttribute
+			return ErrBadAttribute
 		}
 		if AttrType(b[i]) == AttrVendorSpecific {
 			p.Attributes = appendVendorAttributes(p.Attributes, b[i+2:i+alen])
@@ -371,7 +405,32 @@ func Decode(b []byte) (*Packet, error) {
 		}
 		i += alen
 	}
-	return p, nil
+	return nil
+}
+
+// Verifier checks received packets against one shared secret, reusing its hash
+// state and scratch buffer so a receive path running at rate does not allocate.
+//
+// A Verifier is not safe for concurrent use. Give each receiving worker its
+// own.
+type Verifier struct {
+	secret []byte
+	mac    hash.Hash
+	digest hash.Hash
+	buf    []byte
+	sum    []byte
+}
+
+// NewVerifier returns a Verifier for secret.
+func NewVerifier(secret []byte) *Verifier {
+	s := append([]byte(nil), secret...)
+	return &Verifier{
+		secret: s,
+		mac:    hmac.New(md5.New, s),
+		digest: md5.New(),
+		buf:    make([]byte, 0, MaxPacketLen),
+		sum:    make([]byte, 0, AuthenticatorLen),
+	}
 }
 
 // Verify checks a received reply against the request that produced it.
@@ -381,16 +440,16 @@ func Decode(b []byte) (*Packet, error) {
 // present) and the Response Authenticator are checked. Verification mutates a
 // copy, never reply itself.
 func Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte, secret []byte) error {
-	if len(reply) < HeaderLen {
-		return ErrShortPacket
-	}
-	length := int(binary.BigEndian.Uint16(reply[2:4]))
-	if length < HeaderLen || length > MaxPacketLen || len(reply) < length {
-		return ErrBadLength
-	}
+	return NewVerifier(secret).Verify(reply, reqAuthenticator)
+}
 
-	buf := make([]byte, length)
-	copy(buf, reply[:length])
+// Verify checks a received reply against the request that produced it, as the
+// package-level Verify does.
+func (v *Verifier) Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte) error {
+	buf, length, err := v.scratch(reply)
+	if err != nil {
+		return err
+	}
 
 	// The digest covers the packet with the request's authenticator in place
 	// and the Message-Authenticator value zeroed.
@@ -398,6 +457,37 @@ func Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte, secret []byte
 	copy(received[:], buf[4:HeaderLen])
 	copy(buf[4:HeaderLen], reqAuthenticator[:])
 
+	if err := v.checkMessageAuthenticator(buf, length); err != nil {
+		return err
+	}
+
+	v.digest.Reset()
+	v.digest.Write(buf)
+	v.digest.Write(v.secret)
+	v.sum = v.digest.Sum(v.sum[:0])
+	if !hmac.Equal(received[:], v.sum) {
+		return ErrBadAuth
+	}
+	return nil
+}
+
+// scratch copies the packet into the Verifier's buffer, so the checks below can
+// zero fields without touching what the caller was given.
+func (v *Verifier) scratch(pkt []byte) ([]byte, int, error) {
+	if len(pkt) < HeaderLen {
+		return nil, 0, ErrShortPacket
+	}
+	length := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if length < HeaderLen || length > MaxPacketLen || len(pkt) < length {
+		return nil, 0, ErrBadLength
+	}
+	v.buf = append(v.buf[:0], pkt[:length]...)
+	return v.buf, length, nil
+}
+
+// checkMessageAuthenticator verifies the digest in place, if the packet carries
+// one, and leaves buf as it found it.
+func (v *Verifier) checkMessageAuthenticator(buf []byte, length int) error {
 	for i := HeaderLen; i < length; {
 		if i+2 > length {
 			return ErrBadAttribute
@@ -413,21 +503,18 @@ func Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte, secret []byte
 			var got [AuthenticatorLen]byte
 			copy(got[:], buf[i+2:i+alen])
 			copy(buf[i+2:i+alen], zeros[:])
-			mac := hmac.New(md5.New, secret)
-			mac.Write(buf)
-			if !hmac.Equal(got[:], mac.Sum(nil)) {
+
+			v.mac.Reset()
+			v.mac.Write(buf)
+			v.sum = v.mac.Sum(v.sum[:0])
+			if !hmac.Equal(got[:], v.sum) {
 				return ErrBadMessageAuth
 			}
+			// Restore it; the authenticator digest covers the packet with the
+			// completed Message-Authenticator in place.
 			copy(buf[i+2:i+alen], got[:])
 		}
 		i += alen
-	}
-
-	h := md5.New()
-	h.Write(buf)
-	h.Write(secret)
-	if !hmac.Equal(received[:], h.Sum(nil)) {
-		return ErrBadAuth
 	}
 	return nil
 }
@@ -444,16 +531,16 @@ func Verify(reply []byte, reqAuthenticator [AuthenticatorLen]byte, secret []byte
 //
 // Verification works on a copy and never mutates req.
 func VerifyRequest(req, secret []byte) error {
-	if len(req) < HeaderLen {
-		return ErrShortPacket
-	}
-	length := int(binary.BigEndian.Uint16(req[2:4]))
-	if length < HeaderLen || length > MaxPacketLen || len(req) < length {
-		return ErrBadLength
-	}
+	return NewVerifier(secret).VerifyRequest(req)
+}
 
-	buf := make([]byte, length)
-	copy(buf, req[:length])
+// VerifyRequest checks a received request, as the package-level VerifyRequest
+// does.
+func (v *Verifier) VerifyRequest(req []byte) error {
+	buf, length, err := v.scratch(req)
+	if err != nil {
+		return err
+	}
 
 	derived := !Code(buf[0]).randomAuthenticator()
 
@@ -465,42 +552,19 @@ func VerifyRequest(req, secret []byte) error {
 		copy(buf[4:HeaderLen], zeros[:])
 	}
 
-	for i := HeaderLen; i < length; {
-		if i+2 > length {
-			return ErrBadAttribute
-		}
-		alen := int(buf[i+1])
-		if alen < 2 || i+alen > length {
-			return ErrBadAttribute
-		}
-		if AttrType(buf[i]) == AttrMessageAuthenticator {
-			if alen != messageAuthenticatorLen {
-				return ErrBadMessageAuth
-			}
-			var got [AuthenticatorLen]byte
-			copy(got[:], buf[i+2:i+alen])
-			copy(buf[i+2:i+alen], zeros[:])
-
-			mac := hmac.New(md5.New, secret)
-			mac.Write(buf)
-			if !hmac.Equal(got[:], mac.Sum(nil)) {
-				return ErrBadMessageAuth
-			}
-			// Restore it; the authenticator digest below covers the packet
-			// with the completed Message-Authenticator in place.
-			copy(buf[i+2:i+alen], got[:])
-		}
-		i += alen
+	if err := v.checkMessageAuthenticator(buf, length); err != nil {
+		return err
 	}
 
 	if !derived {
 		return nil
 	}
 
-	h := md5.New()
-	h.Write(buf)
-	h.Write(secret)
-	if !hmac.Equal(received[:], h.Sum(nil)) {
+	v.digest.Reset()
+	v.digest.Write(buf)
+	v.digest.Write(v.secret)
+	v.sum = v.digest.Sum(v.sum[:0])
+	if !hmac.Equal(received[:], v.sum) {
 		return ErrBadAuth
 	}
 	return nil

@@ -43,21 +43,41 @@ func EncryptUserPassword(dst, password, secret []byte, reqAuthenticator [Authent
 	dst = append(dst, zeros[:padded-len(password)]...)
 	out := dst[start : start+padded]
 
-	// The MD5 state covering the secret is identical for every block, so it
-	// is computed once and cloned rather than re-fed per block.
-	var digest [AuthenticatorLen]byte
+	// Every block digests the secret followed by the previous block, which
+	// differs only in its last sixteen octets. Assembling that input once and
+	// rewriting the tail lets each block use md5.Sum, whose state lives on the
+	// stack, where a fresh hash per block would allocate on a path that runs
+	// for every Access-Request.
+	var arr [scratchLen]byte
+	scratch := scratchFor(arr[:], secret)
+	tail := scratch[len(secret):]
+
 	prev := reqAuthenticator[:]
 	for off := 0; off < padded; off += AuthenticatorLen {
-		h := md5.New()
-		h.Write(secret)
-		h.Write(prev)
-		h.Sum(digest[:0])
+		copy(tail, prev)
+		digest := md5.Sum(scratch)
 		for i := 0; i < AuthenticatorLen; i++ {
 			out[off+i] ^= digest[i]
 		}
 		prev = out[off : off+AuthenticatorLen]
 	}
 	return dst, nil
+}
+
+// scratchLen sizes the stack buffer the password digests are assembled in. It
+// covers a secret of up to 128 octets plus the sixteen octet block; a longer
+// secret falls back to the heap, which no sensible deployment reaches.
+const scratchLen = 128 + AuthenticatorLen
+
+// scratchFor returns a buffer holding secret followed by room for one block,
+// using arr when the secret fits.
+func scratchFor(arr, secret []byte) []byte {
+	n := len(secret) + AuthenticatorLen
+	if n > len(arr) {
+		return append(make([]byte, 0, n), secret...)[:n]
+	}
+	copy(arr, secret)
+	return arr[:n]
 }
 
 // DecryptUserPassword reverses EncryptUserPassword, returning the cleartext
@@ -68,13 +88,14 @@ func DecryptUserPassword(dst, encrypted, secret []byte, reqAuthenticator [Authen
 	}
 
 	start := len(dst)
-	var digest [AuthenticatorLen]byte
+	var arr [scratchLen]byte
+	scratch := scratchFor(arr[:], secret)
+	tail := scratch[len(secret):]
+
 	prev := reqAuthenticator[:]
 	for off := 0; off < len(encrypted); off += AuthenticatorLen {
-		h := md5.New()
-		h.Write(secret)
-		h.Write(prev)
-		h.Sum(digest[:0])
+		copy(tail, prev)
+		digest := md5.Sum(scratch)
 		for i := 0; i < AuthenticatorLen; i++ {
 			dst = append(dst, encrypted[off+i]^digest[i])
 		}
