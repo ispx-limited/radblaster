@@ -63,3 +63,32 @@ func TestIncludeCycleTerminates(t *testing.T) {
 		t.Fatalf("a cycle should be absorbed, not fail: %v", err)
 	}
 }
+
+// TestLoadingDoesNotMutateTheStandardDictionary is the property Clone exists
+// for: a VALUE line naming a built-in attribute must not append to the set
+// every other dictionary in this process can see.
+func TestLoadingDoesNotMutateTheStandardDictionary(t *testing.T) {
+	before := len(StandardDictionary().ByName("Service-Type").Values)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dictionary")
+	body := "VALUE Service-Type Audit-Marker 4242\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	d, err := LoadDictionary(path)
+	if err != nil {
+		t.Fatalf("LoadDictionary: %v", err)
+	}
+
+	if got := len(StandardDictionary().ByName("Service-Type").Values); got != before {
+		t.Errorf("the shared standard dictionary grew from %d to %d values", before, got)
+	}
+	if got := len(d.ByName("Service-Type").Values); got != before+1 {
+		t.Errorf("the loaded dictionary has %d values, want %d", got, before+1)
+	}
+	if d.ByName("Service-Type") == StandardDictionary().ByName("Service-Type") {
+		t.Error("the clone still points at the shared definition")
+	}
+}

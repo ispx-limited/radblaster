@@ -14,8 +14,13 @@ import (
 // a chain, from recursing until it runs out of stack.
 const maxIncludeDepth = 16
 
-// Clone returns a copy that can be extended without disturbing the original.
-// The shared standard dictionary is never mutated.
+// Clone returns a copy that can be extended without disturbing the original,
+// so that the shared standard dictionary is never mutated.
+//
+// The definitions themselves are copied, not just the maps that point at them.
+// Copying only the maps leaves the clone holding the same *AttrDef values the
+// standard dictionary holds, and a VALUE line naming a built-in attribute then
+// appends to the set that every other dictionary in the process can see.
 func (d *Dictionary) Clone() *Dictionary {
 	out := &Dictionary{
 		byName:     make(map[string]*AttrDef, len(d.byName)),
@@ -23,11 +28,29 @@ func (d *Dictionary) Clone() *Dictionary {
 		byVendor:   make(map[uint32]map[AttrType]*AttrDef, len(d.byVendor)),
 		vendorName: make(map[uint32]string, len(d.vendorName)),
 	}
-	// An array, so this copies rather than aliases: loading into the clone
-	// must not reach back into the shared standard dictionary.
-	out.byNumber = d.byNumber
+
+	// One copy per original, remembered, because an attribute is registered
+	// under several names as well as by number and all of those have to keep
+	// leading to the same definition afterwards.
+	copies := make(map[*AttrDef]*AttrDef, len(d.byName))
+	copyOf := func(def *AttrDef) *AttrDef {
+		if def == nil {
+			return nil
+		}
+		if c, ok := copies[def]; ok {
+			return c
+		}
+		c := *def
+		c.Values = append([]Value(nil), def.Values...)
+		copies[def] = &c
+		return &c
+	}
+
+	for i, def := range d.byNumber {
+		out.byNumber[i] = copyOf(def)
+	}
 	for k, v := range d.byName {
-		out.byName[k] = v
+		out.byName[k] = copyOf(v)
 	}
 	for k, v := range d.vendorIDs {
 		out.vendorIDs[k] = v
@@ -38,7 +61,7 @@ func (d *Dictionary) Clone() *Dictionary {
 	for vendor, attrs := range d.byVendor {
 		m := make(map[AttrType]*AttrDef, len(attrs))
 		for k, v := range attrs {
-			m[k] = v
+			m[k] = copyOf(v)
 		}
 		out.byVendor[vendor] = m
 	}
