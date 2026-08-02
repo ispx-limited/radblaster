@@ -42,14 +42,18 @@ type Server struct {
 	// address literal and localhost. See checkHost.
 	allowedHosts map[string]bool
 
-	mu      sync.Mutex
-	state   State
-	cfg     RunConfig
-	runner  *engine.Runner
-	result  *engine.Result
-	err     string
-	started time.Time
-	history []Sample
+	mu    sync.Mutex
+	state State
+	cfg   RunConfig
+	// starting is held between accepting a start and the engine coming up, so
+	// that opening sockets does not happen under the lock every reader needs
+	// while still admitting only one run at a time.
+	starting bool
+	runner   *engine.Runner
+	result   *engine.Result
+	err      string
+	started  time.Time
+	history  []Sample
 	// latest is the most recent sample of a running run. Rates are deltas
 	// since the previous snapshot, so exactly one goroutine may take them:
 	// letting each watcher sample independently would split the deltas
@@ -147,15 +151,28 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if s.state == StateRunning {
+	if s.state == StateRunning || s.starting {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, errors.New("a run is already going; stop it before starting another"))
 		return
 	}
+	s.starting = true
+	s.mu.Unlock()
 
+	// Bringing a run up opens every socket it will use, which takes long enough
+	// to matter and can fail. Doing that under the lock would stall every
+	// reader of the status for as long as it took, so the slot is held with
+	// starting instead and the lock is taken again only to record the outcome.
 	runner, err := engine.Start(context.Background(), engineCfg)
+
+	s.mu.Lock()
+	s.starting = false
 	if err != nil {
+		// Leave nothing of the previous run behind, or the status reports a
+		// failure alongside results that belong to something else.
 		s.state, s.err = StateFailed, err.Error()
+		s.result, s.history, s.latest = nil, nil, nil
+		s.cfg = cfg.redacted()
 		s.mu.Unlock()
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -290,13 +307,27 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ch, ok := s.addWatcher()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable,
+			errors.New("too many streams are already connected to this instance"))
+		return
+	}
+	defer s.removeWatcher(ch)
+
+	// The server sets a read deadline so that a half-sent request cannot hold a
+	// connection open indefinitely. A stream is the one place that deadline is
+	// wrong: it is meant to stay open for the length of a run, which can be
+	// hours, so it is lifted here and only here.
+	if err := http.NewResponseController(w).SetReadDeadline(time.Time{}); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported here"))
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-
-	ch := s.addWatcher()
-	defer s.removeWatcher(ch)
 
 	send := func(st Status) bool {
 		b, err := json.Marshal(st)
@@ -336,12 +367,25 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) addWatcher() chan Status {
+// maxWatchers bounds how many streams may be connected at once.
+//
+// Each one costs a goroutine, a ticker and a copy of the whole sample history
+// every time the run is sampled, so leaving it unbounded is a way for anything
+// that can open sockets to exhaust the process. The limit is far above what a
+// few operators watching the same run would ever need.
+const maxWatchers = 64
+
+// addWatcher registers a stream, or reports false when too many are already
+// connected.
+func (s *Server) addWatcher() (chan Status, bool) {
 	ch := make(chan Status, 4)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.watchers) >= maxWatchers {
+		return nil, false
+	}
 	s.watchers[ch] = struct{}{}
-	s.mu.Unlock()
-	return ch
+	return ch, true
 }
 
 func (s *Server) removeWatcher(ch chan Status) {

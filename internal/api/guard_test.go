@@ -170,3 +170,19 @@ func TestCheckHost(t *testing.T) {
 		}
 	}
 }
+
+// A watcher cap keeps a browser, or anything else that can open sockets, from
+// holding a goroutine and a copy of the history each until the process runs out.
+func TestStreamWatchersAreCapped(t *testing.T) {
+	srv := New(nil, nil, nil)
+	t.Cleanup(srv.Close)
+
+	for i := range maxWatchers {
+		if _, ok := srv.addWatcher(); !ok {
+			t.Fatalf("watcher %d was refused before the cap", i)
+		}
+	}
+	if _, ok := srv.addWatcher(); ok {
+		t.Fatal("a watcher past the cap was accepted")
+	}
+}

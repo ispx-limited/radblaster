@@ -58,6 +58,12 @@ func runServe(args []string) error {
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A body that arrives one byte at a time would otherwise hold its
+		// connection, and its goroutine, for as long as the sender cared to
+		// keep it. There is no write deadline: the event stream is meant to
+		// stay open for the length of a run, which can be hours.
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
 
 	reportDictionaries(dict, dictPaths)
@@ -69,8 +75,13 @@ func runServe(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "radblaster is at http://%s\n", ln.Addr())
 	fmt.Fprintf(os.Stderr, "Profiles are kept in %s\n", store.Dir())
-	if h, _, err := net.SplitHostPort(*addr); err == nil && (h == "" || h == "0.0.0.0" || h == "::") {
+	// Warn on anything that is not loopback, taken from the listener rather
+	// than the flag. Pinning a LAN address is exactly what someone does when
+	// they want a colleague to see the dashboard, and that used to pass without
+	// a word because only the wildcard forms were checked.
+	if !isLoopbackAddr(ln.Addr()) {
 		fmt.Fprintln(os.Stderr, "Warning: this is reachable from the network and has no authentication.")
+		fmt.Fprintln(os.Stderr, "Anyone who can reach it can start a run against any server this machine can.")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -90,4 +101,14 @@ func runServe(args []string) error {
 		}
 		return err
 	}
+}
+
+// isLoopbackAddr reports whether a listening address is confined to this
+// machine. A wildcard bind is not, even though it includes loopback.
+func isLoopbackAddr(a net.Addr) bool {
+	t, ok := a.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	return t.IP != nil && t.IP.IsLoopback()
 }
