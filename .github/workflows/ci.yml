@@ -40,3 +40,40 @@ jobs:
 
       - name: Build
         run: make build
+
+  # The interface's built assets are committed and embedded into every binary,
+  # so nothing in the Go build would notice if they stopped matching ui/src.
+  # This rebuilds them and fails if the result differs from what is committed.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        # Pinned to a commit rather than a tag, as above.
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Rebuild the interface
+        run: make ui
+
+      - name: Check the committed bundle matches
+        run: |
+          # Asset filenames carry a content hash, so a changed bundle arrives
+          # as a new file. --intent-to-add puts those in front of git diff,
+          # which otherwise only reports on files it already tracks.
+          git add --intent-to-add -A internal/web/dist
+          if ! git diff --exit-code internal/web/dist; then
+            echo "internal/web/dist does not match a build of ui/src." >&2
+            echo "Run 'make ui' and commit the result." >&2
+            exit 1
+          fi
