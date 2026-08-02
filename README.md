@@ -75,6 +75,22 @@ would generate it, without the BNG. It models subscriber sessions rather than
 individual packets, so an Access-Request is followed by the accounting records
 a real session would produce.
 
+## Install
+
+Download a build for Linux or macOS from the
+[releases page](https://github.com/ispx-limited/radblaster/releases), or take the
+latest directly:
+
+```sh
+curl -fsSL https://github.com/ispx-limited/radblaster/releases/latest/download/radblaster_linux_amd64.tar.gz | tar xz
+./radblaster_linux_amd64/radblaster version
+```
+
+Replace `linux_amd64` with `linux_arm64`, `darwin_amd64` or `darwin_arm64` as
+needed. There is no Windows build. Each archive holds a single binary with the
+web interface built in, so nothing else needs installing, and `checksums.txt` on
+the release verifies the download.
+
 ## Building
 
 Requires Go 1.24 or later.
