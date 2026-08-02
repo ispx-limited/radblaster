@@ -12,6 +12,8 @@ radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
                -password secret -rate 500 -count 50000 -hold 30m
 ```
 
+Documentation is at [docs.radblaster.ispx.co](https://docs.radblaster.ispx.co/).
+
 ## Status
 
 Early but useful. The full subscriber session lifecycle works end to end

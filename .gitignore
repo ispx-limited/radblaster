@@ -6,6 +6,9 @@ dist/
 coverage.out
 coverage.html
 
+# The built documentation site.
+site/
+
 # Local environment
 .env
 *.local
