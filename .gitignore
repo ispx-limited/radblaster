@@ -1,0 +1,19 @@
+bin/
+dist/
+# The interface's built assets are the exception: they are committed so that
+# building radblaster needs only Go, with no node toolchain in the way.
+!internal/web/dist/
+coverage.out
+coverage.html
+
+# The built documentation site.
+site/
+
+# Local environment
+.env
+*.local
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store

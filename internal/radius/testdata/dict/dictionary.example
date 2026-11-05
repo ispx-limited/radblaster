@@ -1,0 +1,14 @@
+# A vendor whose attributes use the common one-octet type and length.
+VENDOR		Example			12345
+
+BEGIN-VENDOR	Example
+ATTRIBUTE	Example-AVPair		1	string
+ATTRIBUTE	Example-Bandwidth-Up	2	integer
+ATTRIBUTE	Example-Gateway		3	ipaddr
+ATTRIBUTE	Example-Flags		4	byte
+ATTRIBUTE	Example-Policy		5	integer
+
+VALUE	Example-Policy		Gold		1
+VALUE	Example-Policy		Silver		2
+VALUE	Example-Policy		Bronze		3
+END-VENDOR	Example
