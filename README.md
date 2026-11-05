@@ -1,11 +1,12 @@
 # radblaster
 
-**Stress test your RADIUS infrastructure without a BNG in the way.**
+**Load test your RADIUS platform with subscribers, not packets.**
 
-Testing whether your AAA stack survives a BNG reload normally means owning a
-BNG. radblaster speaks RADIUS directly, so you can put realistic subscriber
-load on your authentication and accounting servers with one binary and no
-access network.
+An ISP's AAA platform does its hardest work at the worst possible moment: a BNG
+reboots and every subscriber on it re-authenticates at once. Rehearsing that
+means producing whole sessions at rate, with the accounting that follows them
+and the disconnects that come back, which is why it normally means owning a
+BNG. radblaster produces them directly.
 
 ```sh
 radblaster run -server 10.0.0.1:1812 -acct-server 10.0.0.1:1813 \
@@ -23,42 +24,51 @@ authentication alone sustains over two million requests per second with no
 packets dropped, so what a run measures is the server rather than the
 generator. There is a web interface for driving runs and watching them happen.
 
-What works:
+What it does that sending Access-Requests does not:
 
-- **Whole subscriber sessions**, not just packets: an Access-Request, then an
-  Accounting-Start, interim updates for as long as the session is online, and
-  an Accounting-Stop with the final counters
-- `Class` and `Framed-IP-Address` from the Access-Accept carried into every
-  accounting record, as a real access node would
-- `Acct-Interim-Interval` from the Access-Accept honoured per session, so the
-  server controls how much accounting load it receives
-- Octet counters that roll into `Acct-Input-Gigawords` and
-  `Acct-Output-Gigawords` past four gibibytes, which is where accounting
-  pipelines tend to break
-- PAP and CHAP authentication
-- Results broken out per exchange, so authentication staying healthy while
-  accounting collapses is visible rather than averaged away
-- Latency percentiles reported both from the scheduled send and from the actual
-  send, so time lost to the generator falling behind cannot be mistaken for the
-  server being slow
-- Failures separated by cause: a timeout, a reply that fails verification, and a
-  policy rejection are counted apart, because they need different remedies
-- Notes explaining what limited the run, including the throughput ceiling
-  implied by the number of links and the server's response time
-- **Answers CoA-Request and Disconnect-Request** as an access node would, so a
-  bulk policy change or a mass disconnect can be tested from the server side
-- **Vendor-specific attributes**, resolved by name from the dictionary files
-  your own RADIUS server already uses, or written by number with no dictionary
+- **Whole subscriber sessions.** An Access-Request, then an Accounting-Start,
+  interim updates for as long as the subscriber is online, and an
+  Accounting-Stop with the final counters. `Class` and `Framed-IP-Address` from
+  the Access-Accept are carried into every accounting record, and
+  `Acct-Interim-Interval` is honoured per session, so the server decides how
+  much accounting load it gets
+- **Octet counters that roll past four gibibytes** into
+  `Acct-Input-Gigawords` and `Acct-Output-Gigawords`. That rollover is where
+  accounting pipelines break, and a test that quietly stays under the limit
+  proves nothing about the one that does not
+- **Answers CoA-Request and Disconnect-Request** as an access node would, which
+  is the only way the half of your policy plane that pushes changes gets tested
   at all
-- **Retransmission**, repeating the exact bytes so a server can recognise the
-  duplicate, with the retry count reported because retries otherwise hide loss
-- A live status line while a run is going, showing the outstanding request
-  count, which moves before any latency figure does
-- **A web interface** for setting up a run, watching it live and reading the
-  result, driven entirely through the same API the command line uses
+- **A rejection path you can dial in.** Rejection is slower and different, and
+  a platform that is fine until a line card flaps and thousands of stale
+  credentials arrive at once will only show that under a load containing some
+- **Load shapes**: ramp to find the knee, burst to catch a server that copes
+  with load but not with change, stampede for the reload where everyone
+  arrives together
+- **Results broken out per exchange**, with failures separated by cause, so
+  authentication staying healthy while accounting collapses is visible rather
+  than averaged away, and a timeout, an unverifiable reply and a policy
+  rejection are never added together
+- **Latency measured twice**, from the scheduled send and from the actual send,
+  so time lost to the generator falling behind cannot be charged to the server
+- **Notes that say what limited the run**, including whether the ceiling it hit
+  was the server's or this tool's
 - **Profiles**: an estate saved as a YAML file the interface edits, the command
   line runs, and you commit alongside whatever else describes that network
-- Reproducible runs with `-seed`
+- **A web interface** for setting a run up, watching it live and reading the
+  result, on the same API the command line uses
+
+It also does what any RADIUS client does, without making a feature of it: PAP
+and CHAP, vendor attributes by name from your own dictionaries or by number
+without them, retransmission with backoff, and reproducible runs with `-seed`.
+
+Every Access-Request carries a Message-Authenticator and every reply is
+required to carry one back. The Response Authenticator on its own is an
+unkeyed MD5 digest, which CVE-2024-3596 shows can be forged on the path, so a
+reply resting on it alone would let an attacker turn a rejection into an
+acceptance and quietly flatter the server under test. A server that does not
+sign its replies is reported as exactly that rather than as a bad secret; pass
+`-allow-missing-message-authenticator` to measure one anyway.
 
 What does not work yet:
 

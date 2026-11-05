@@ -401,3 +401,39 @@ header a h1 {
   font-size: 1.1rem;
   font-weight: 650;
 }
+
+/* ============================================================
+   radblaster additions.
+   ============================================================ */
+
+/* A card is a label in a grid, not a section of a document. The template gives
+   every h3 an accent dot, a left indent and a permalink anchor, which turns the
+   overview into a list of bullets. Undo all three inside a card and nowhere
+   else. These selectors carry the article and typography ancestors because the
+   rules they override do; without them the override loses the cascade. */
+article .typography .ispx-card h3 {
+  margin: 0 0 0.5rem;
+  padding-left: 0;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+article .typography .ispx-card h3::before {
+  content: none;
+}
+
+article .typography .ispx-card h3 .headerlink {
+  display: none;
+}
+
+article .typography .ispx-card p {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+/* Three narrow columns stack a two sentence card into a ribbon. Fewer, wider
+   ones read as cards. */
+.ispx-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+}
